@@ -1,0 +1,5 @@
+﻿models/
+__pycache__/
+data/mnist/
+*.pth
+*.pyc
