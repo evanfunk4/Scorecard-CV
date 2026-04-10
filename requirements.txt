@@ -1,0 +1,20 @@
+sympy==1.13
+
+# Core ML
+torch
+torchvision
+transformers
+datasets
+
+# Image Processing
+opencv-python
+Pillow
+pymupdf
+
+# Development Tools
+jupyterlab
+pandas
+matplotlib
+
+pytesseract
+
