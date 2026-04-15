@@ -3,3 +3,5 @@ __pycache__/
 data/mnist/
 *.pth
 *.pyc
+
+.DS_Store
