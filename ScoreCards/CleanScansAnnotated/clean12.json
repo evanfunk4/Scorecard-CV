@@ -1,9 +1,9 @@
 {
-  "image": "/Users/evanfunk4/Desktop/Georgia Tech\ud83d\udc1d/Spring 2026/CS 4641/Project/HoughLine/ml_rowsep_labels_exported/images/clean12.png",
-  "table_mask": "/Users/evanfunk4/Desktop/Georgia Tech\ud83d\udc1d/Spring 2026/CS 4641/Project/HoughLine/ml_rowsep_labels_exported/masks/clean12_table.png",
-  "v_mask": "/Users/evanfunk4/Desktop/Georgia Tech\ud83d\udc1d/Spring 2026/CS 4641/Project/HoughLine/ml_rowsep_labels_exported/masks/clean12_v.png",
-  "h_mask": "/Users/evanfunk4/Desktop/Georgia Tech\ud83d\udc1d/Spring 2026/CS 4641/Project/HoughLine/ml_rowsep_labels_exported/masks/clean12_h.png",
-  "h_line_mask": "/Users/evanfunk4/Desktop/Georgia Tech\ud83d\udc1d/Spring 2026/CS 4641/Project/HoughLine/ml_rowsep_labels_exported/masks/clean12_h_line.png",
-  "h_boundary_mask": "/Users/evanfunk4/Desktop/Georgia Tech\ud83d\udc1d/Spring 2026/CS 4641/Project/HoughLine/ml_rowsep_labels_exported/masks/clean12_h_boundary.png",
-  "source_rowsep_json": "/Users/evanfunk4/Desktop/Georgia Tech\ud83d\udc1d/Spring 2026/CS 4641/Project/HoughLine/ml_rowsep_labels/clean12.json"
+  "image": "images/clean12.png",
+  "table_mask": "masks/clean12_table.png",
+  "v_mask": "masks/clean12_v.png",
+  "h_mask": "masks/clean12_h.png",
+  "h_line_mask": "masks/clean12_h_line.png",
+  "h_boundary_mask": "masks/clean12_h_boundary.png",
+  "source_rowsep_json": "clean12.json"
 }
