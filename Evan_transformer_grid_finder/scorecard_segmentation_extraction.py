@@ -859,6 +859,7 @@ class InferConfig:
     max_rows: int = 26
     min_cols: int = 4
     max_cols: int = 34
+    min_keep_cols: int = 9
 
     min_gap_px: int = 8
     peak_rel_thresh: float = 0.12
@@ -3275,6 +3276,9 @@ class GridDecoder:
             x_lines, y_lines = self._trim_weak_outer_lines(v_hard, h_hard, x_lines, y_lines, line_thr=line_thr)
             if len(x_lines) < 2 or len(y_lines) < 2:
                 continue
+            cols_final = max(0, len(x_lines) - 1)
+            if cols_final < int(self.cfg.min_keep_cols):
+                continue
 
             # Presence drives merged-cell decisions; use raw model line maps to avoid
             # color-edge artifacts splitting cells.
@@ -3678,6 +3682,7 @@ def _infer_cli(args: argparse.Namespace) -> None:
         max_rows=int(args.max_rows),
         min_cols=int(args.min_cols),
         max_cols=int(args.max_cols),
+        min_keep_cols=int(args.min_keep_cols),
         min_gap_px=int(args.min_gap_px),
         peak_rel_thresh=float(args.peak_rel_thresh),
         min_line_cov=float(args.min_line_cov),
@@ -3719,6 +3724,7 @@ def _batch_cli(args: argparse.Namespace) -> None:
         max_rows=int(args.max_rows),
         min_cols=int(args.min_cols),
         max_cols=int(args.max_cols),
+        min_keep_cols=int(args.min_keep_cols),
         min_gap_px=int(args.min_gap_px),
         peak_rel_thresh=float(args.peak_rel_thresh),
         min_line_cov=float(args.min_line_cov),
@@ -3803,6 +3809,7 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument("--max_rows", type=int, default=26)
     inf.add_argument("--min_cols", type=int, default=4)
     inf.add_argument("--max_cols", type=int, default=34)
+    inf.add_argument("--min_keep_cols", type=int, default=9)
     inf.add_argument("--min_gap_px", type=int, default=8)
     inf.add_argument("--peak_rel_thresh", type=float, default=0.12)
     inf.add_argument("--min_line_cov", type=float, default=0.24)
@@ -3833,6 +3840,7 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--max_rows", type=int, default=26)
     bt.add_argument("--min_cols", type=int, default=4)
     bt.add_argument("--max_cols", type=int, default=34)
+    bt.add_argument("--min_keep_cols", type=int, default=9)
     bt.add_argument("--min_gap_px", type=int, default=8)
     bt.add_argument("--peak_rel_thresh", type=float, default=0.12)
     bt.add_argument("--min_line_cov", type=float, default=0.24)

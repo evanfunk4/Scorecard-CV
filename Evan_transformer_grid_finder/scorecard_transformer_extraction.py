@@ -1172,6 +1172,7 @@ def _infer_cfg_from_args(args: argparse.Namespace) -> InferConfig:
         max_rows=int(args.max_rows),
         min_cols=int(args.min_cols),
         max_cols=int(args.max_cols),
+        min_keep_cols=int(args.min_keep_cols),
         min_gap_px=int(args.min_gap_px),
         peak_rel_thresh=float(args.peak_rel_thresh),
         min_line_cov=float(args.min_line_cov),
@@ -1291,6 +1292,7 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument("--max_rows", type=int, default=26)
     inf.add_argument("--min_cols", type=int, default=4)
     inf.add_argument("--max_cols", type=int, default=34)
+    inf.add_argument("--min_keep_cols", type=int, default=9)
     inf.add_argument("--min_gap_px", type=int, default=8)
     inf.add_argument("--peak_rel_thresh", type=float, default=0.12)
     inf.add_argument("--min_line_cov", type=float, default=0.24)
@@ -1323,6 +1325,7 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--max_rows", type=int, default=26)
     bt.add_argument("--min_cols", type=int, default=4)
     bt.add_argument("--max_cols", type=int, default=34)
+    bt.add_argument("--min_keep_cols", type=int, default=9)
     bt.add_argument("--min_gap_px", type=int, default=8)
     bt.add_argument("--peak_rel_thresh", type=float, default=0.12)
     bt.add_argument("--min_line_cov", type=float, default=0.24)
