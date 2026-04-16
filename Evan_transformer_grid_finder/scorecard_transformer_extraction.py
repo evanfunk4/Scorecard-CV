@@ -908,8 +908,10 @@ def _run_one_with_model(
     if raw is None:
         raise FileNotFoundError(f"Failed to load image: {input_image}")
 
-    prep = preprocess_scorecard(raw, pre_cfg or PreprocessConfig())
+    pre_cfg_eff = pre_cfg or PreprocessConfig(ensure_upright=False)
+    prep = preprocess_scorecard(raw, pre_cfg_eff)
     image0 = prep.image_bgr
+    allow_upright = bool(pre_cfg_eff.ensure_upright)
 
     decoder = GridDecoder(infer_cfg)
 
@@ -974,9 +976,8 @@ def _run_one_with_model(
             s += 0.45 * float(ocr)
         return float(s)
 
-    # Orientation chooser: disambiguate occasional upside-down outputs.
-    # Respect explicit no_upright by skipping any 180 post-flip check.
-    if pre_cfg is not None and not bool(pre_cfg.ensure_upright):
+    # Orientation chooser: disabled by default. Enable with --upright.
+    if not allow_upright:
         cand_imgs = [(0, image0)]
     else:
         cand_imgs = [(0, image0), (180, cv2.rotate(image0, cv2.ROTATE_180))]
@@ -1001,34 +1002,35 @@ def _run_one_with_model(
     _, add_rot, image, table_prob, v_prob, h_prob, j_prob, decoded = cand_out[0]
     upright_rot = int((int(prep.upright_rotation_degrees) + int(add_rot)) % 360)
 
-    # Final orientation correction for output artifacts:
-    # if OCR readability strongly favors the 180-flipped view, flip outputs.
-    g0 = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    g1_img = cv2.rotate(image, cv2.ROTATE_180)
-    g1 = cv2.cvtColor(g1_img, cv2.COLOR_BGR2GRAY)
-    s0 = _ocr_readability_score(g0)
-    s1 = _ocr_readability_score(g1)
-    if s0 is not None and s1 is not None and float(s1) > float(s0) + 1.10:
-        ih, iw = image.shape[:2]
-        image = g1_img
-        table_prob = cv2.rotate(table_prob, cv2.ROTATE_180)
-        v_prob = cv2.rotate(v_prob, cv2.ROTATE_180)
-        h_prob = cv2.rotate(h_prob, cv2.ROTATE_180)
-        j_prob = cv2.rotate(j_prob, cv2.ROTATE_180)
-        decoded = _rotate_decoded_180(decoded, h=ih, w=iw)
-        upright_rot = int((upright_rot + 180) % 360)
+    if allow_upright:
+        # Final orientation correction for output artifacts:
+        # if OCR readability strongly favors the 180-flipped view, flip outputs.
+        g0 = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        g1_img = cv2.rotate(image, cv2.ROTATE_180)
+        g1 = cv2.cvtColor(g1_img, cv2.COLOR_BGR2GRAY)
+        s0 = _ocr_readability_score(g0)
+        s1 = _ocr_readability_score(g1)
+        if s0 is not None and s1 is not None and float(s1) > float(s0) + 1.10:
+            ih, iw = image.shape[:2]
+            image = g1_img
+            table_prob = cv2.rotate(table_prob, cv2.ROTATE_180)
+            v_prob = cv2.rotate(v_prob, cv2.ROTATE_180)
+            h_prob = cv2.rotate(h_prob, cv2.ROTATE_180)
+            j_prob = cv2.rotate(j_prob, cv2.ROTATE_180)
+            decoded = _rotate_decoded_180(decoded, h=ih, w=iw)
+            upright_rot = int((upright_rot + 180) % 360)
 
-    # Normalize final artifacts to non-upside-down orientation.
-    # This keeps extracted cell matrices upright for downstream OCR.
-    if int(upright_rot) == 180:
-        ih, iw = image.shape[:2]
-        image = cv2.rotate(image, cv2.ROTATE_180)
-        table_prob = cv2.rotate(table_prob, cv2.ROTATE_180)
-        v_prob = cv2.rotate(v_prob, cv2.ROTATE_180)
-        h_prob = cv2.rotate(h_prob, cv2.ROTATE_180)
-        j_prob = cv2.rotate(j_prob, cv2.ROTATE_180)
-        decoded = _rotate_decoded_180(decoded, h=ih, w=iw)
-        upright_rot = 0
+        # Normalize final artifacts to non-upside-down orientation.
+        # This keeps extracted cell matrices upright for downstream OCR.
+        if int(upright_rot) == 180:
+            ih, iw = image.shape[:2]
+            image = cv2.rotate(image, cv2.ROTATE_180)
+            table_prob = cv2.rotate(table_prob, cv2.ROTATE_180)
+            v_prob = cv2.rotate(v_prob, cv2.ROTATE_180)
+            h_prob = cv2.rotate(h_prob, cv2.ROTATE_180)
+            j_prob = cv2.rotate(j_prob, cv2.ROTATE_180)
+            decoded = _rotate_decoded_180(decoded, h=ih, w=iw)
+            upright_rot = 0
 
     if bool(force_output_rotate_180):
         ih, iw = image.shape[:2]
@@ -1188,7 +1190,7 @@ def _infer_cfg_from_args(args: argparse.Namespace) -> InferConfig:
 def _infer_cli(args: argparse.Namespace) -> None:
     cfg = _infer_cfg_from_args(args)
     pre_cfg = PreprocessConfig(
-        ensure_upright=not bool(args.no_upright),
+        ensure_upright=bool(args.upright and not args.no_upright),
         upright_use_osd=False,
         upright_allow_180_without_osd=False,
         upright_180_margin=2.6,
@@ -1215,7 +1217,7 @@ def _infer_cli(args: argparse.Namespace) -> None:
 def _batch_cli(args: argparse.Namespace) -> None:
     cfg = _infer_cfg_from_args(args)
     pre_cfg = PreprocessConfig(
-        ensure_upright=not bool(args.no_upright),
+        ensure_upright=bool(args.upright and not args.no_upright),
         upright_use_osd=False,
         upright_allow_180_without_osd=False,
         upright_180_margin=2.6,
@@ -1302,7 +1304,8 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument("--min_cell_w", type=int, default=10)
     inf.add_argument("--min_cell_h", type=int, default=10)
     inf.add_argument("--no_auto_tune", action="store_true")
-    inf.add_argument("--no_upright", action="store_true")
+    inf.add_argument("--upright", action="store_true", help="Enable 90/180 upright normalization (disabled by default).")
+    inf.add_argument("--no_upright", action="store_true", help=argparse.SUPPRESS)
     inf.add_argument("--force_output_rotate_180", action="store_true")
     inf.set_defaults(func=_infer_cli)
 
@@ -1335,7 +1338,8 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--min_cell_w", type=int, default=10)
     bt.add_argument("--min_cell_h", type=int, default=10)
     bt.add_argument("--no_auto_tune", action="store_true")
-    bt.add_argument("--no_upright", action="store_true")
+    bt.add_argument("--upright", action="store_true", help="Enable 90/180 upright normalization (disabled by default).")
+    bt.add_argument("--no_upright", action="store_true", help=argparse.SUPPRESS)
     bt.add_argument("--force_output_rotate_180", action="store_true")
     bt.set_defaults(func=_batch_cli)
     return p

@@ -3575,13 +3575,14 @@ def _run_one_with_model(
     output_dir: Path,
     infer_cfg: InferConfig,
     device: str,
+    pre_cfg: Optional[PreprocessConfig] = None,
 ) -> dict:
     _ensure_dir(output_dir)
     raw = cv2.imread(str(input_image), cv2.IMREAD_COLOR)
     if raw is None:
         raise FileNotFoundError(f"Failed to load image: {input_image}")
 
-    prep = preprocess_scorecard(raw, PreprocessConfig())
+    prep = preprocess_scorecard(raw, pre_cfg or PreprocessConfig(ensure_upright=False))
     image = prep.image_bgr
     cv2.imwrite(str(output_dir / "debug_preprocessed.png"), image)
 
@@ -3653,7 +3654,14 @@ def _run_one_with_model(
     return payload
 
 
-def _run_one(weights: Path, input_image: Path, output_dir: Path, infer_cfg: InferConfig, device: str) -> dict:
+def _run_one(
+    weights: Path,
+    input_image: Path,
+    output_dir: Path,
+    infer_cfg: InferConfig,
+    device: str,
+    pre_cfg: Optional[PreprocessConfig] = None,
+) -> dict:
     model, torch, F, _ = _load_model(weights=weights, device=device)
     return _run_one_with_model(
         model=model,
@@ -3663,6 +3671,7 @@ def _run_one(weights: Path, input_image: Path, output_dir: Path, infer_cfg: Infe
         output_dir=output_dir,
         infer_cfg=infer_cfg,
         device=device,
+        pre_cfg=pre_cfg,
     )
 
 
@@ -3700,6 +3709,7 @@ def _infer_cli(args: argparse.Namespace) -> None:
         output_dir=Path(args.output_dir),
         infer_cfg=cfg,
         device=str(args.device),
+        pre_cfg=PreprocessConfig(ensure_upright=bool(args.upright)),
     )
     print(f"Image: {args.input}")
     print(f"Output: {args.output_dir}")
@@ -3756,6 +3766,7 @@ def _batch_cli(args: argparse.Namespace) -> None:
             output_dir=out,
             infer_cfg=cfg,
             device=str(args.device),
+            pre_cfg=PreprocessConfig(ensure_upright=bool(args.upright)),
         )
         table_str = ", ".join([f"t{int(t['table_id'])}:r{int(t['rows_base'])}c{int(t['cols_base'])}" for t in result["tables"]])
         print(f"{p.name}: tables={result['table_count']} [{table_str}] rot={result['upright_rotation_degrees']}")
@@ -3819,6 +3830,7 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument("--min_cell_w", type=int, default=10)
     inf.add_argument("--min_cell_h", type=int, default=10)
     inf.add_argument("--no_auto_tune", action="store_true")
+    inf.add_argument("--upright", action="store_true", help="Enable 90/180 upright normalization (disabled by default).")
     inf.set_defaults(func=_infer_cli)
 
     bt = sub.add_parser("batch", help="Infer all PNG images in a folder")
@@ -3850,6 +3862,7 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--min_cell_w", type=int, default=10)
     bt.add_argument("--min_cell_h", type=int, default=10)
     bt.add_argument("--no_auto_tune", action="store_true")
+    bt.add_argument("--upright", action="store_true", help="Enable 90/180 upright normalization (disabled by default).")
     bt.set_defaults(func=_batch_cli)
 
     return p

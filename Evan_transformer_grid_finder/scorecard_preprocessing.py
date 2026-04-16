@@ -24,7 +24,7 @@ class PreprocessConfig:
     """Configuration for scorecard preprocessing."""
 
     target_long_edge: int = 1800
-    ensure_upright: bool = True
+    ensure_upright: bool = False
     upright_use_ocr: bool = True
     upright_use_osd: bool = True
     upright_osd_min_confidence: float = 2.0
@@ -702,16 +702,21 @@ if __name__ == "__main__":
         help="Directory for intermediate images.",
     )
     parser.add_argument(
+        "--upright",
+        action="store_true",
+        help="Enable automatic upright orientation normalization (disabled by default).",
+    )
+    parser.add_argument(
         "--no_upright",
         action="store_true",
-        help="Disable automatic upright orientation normalization.",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
     img = load_image(args.input)
     result = preprocess_scorecard(
         img,
-        PreprocessConfig(ensure_upright=not args.no_upright),
+        PreprocessConfig(ensure_upright=bool(args.upright and not args.no_upright)),
     )
     _save_debug_outputs(result, Path(args.debug_dir))
     print(f"Upright rotation applied: {result.upright_rotation_degrees} degrees clockwise")
