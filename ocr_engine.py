@@ -41,7 +41,7 @@ class OCREngine:
         """
         gray = np.array(image.convert("L"))
         light_ratio = np.sum(gray > 180) / gray.size
-        print(f"  [EMPTY CHECK] light_ratio={light_ratio:.3f}, threshold={threshold}")
+        # print(f"  [EMPTY CHECK] light_ratio={light_ratio:.3f}, threshold={threshold}")
         return light_ratio > threshold
  
     def remove_grid_lines(self, image: Image.Image, border=4) -> Image.Image:

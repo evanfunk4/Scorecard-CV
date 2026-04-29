@@ -1,7 +1,42 @@
-﻿models/
-__pycache__/
-data/mnist/
-*.pth
-*.pyc
+﻿# Data files
+data/
+*.pdf
+*.png
+*.jpg
+*.jpeg
 
+# Model weights
+models/
+*.pth
+*.pt
+*.h5
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Results and outputs
+results/
+pipeline_output/
+preprocessing_visualization/
+
+# Labels (if they contain sensitive data)
+interactive_labels.json
+evaluation_labels.json
+
+# OS files
 .DS_Store
+Thumbs.db
