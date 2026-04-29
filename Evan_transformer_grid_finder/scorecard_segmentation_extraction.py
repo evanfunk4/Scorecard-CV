@@ -18,7 +18,7 @@ Design notes:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 import argparse
@@ -895,6 +895,11 @@ class InferConfig:
     min_hline_junction_hit: float = 0.50
     presence_min_run_ratio: float = 0.46
     merge_presence_min_cov: float = 0.30
+    conservative_table_bbox: bool = False
+    conservative_max_width_ratio: float = 0.88
+    conservative_max_height_ratio: float = 0.96
+    conservative_prefer_compact_bonus: float = 0.22
+    legacy_decode: bool = False
 
     cell_inset_px: int = 2
     min_cell_w: int = 10
@@ -909,6 +914,8 @@ class DecodedGrid:
     y_lines: list[int]
     v_presence: np.ndarray
     h_presence: np.ndarray
+    v_polylines: Optional[list[list[list[int]]]] = None
+    h_polylines: Optional[list[list[list[int]]]] = None
 
 
 class GridDecoder:
@@ -1002,6 +1009,170 @@ class GridDecoder:
         return (keep.astype(np.float32) / 255.0).astype(np.float32)
 
     @staticmethod
+    def _image_horizontal_line_evidence_map(image_bgr: np.ndarray) -> np.ndarray:
+        if image_bgr is None or image_bgr.size == 0:
+            return np.zeros((0, 0), dtype=np.float32)
+        rot = cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
+        v_rot = GridDecoder._image_vertical_line_evidence_map(rot)
+        if v_rot.size == 0:
+            h, w = image_bgr.shape[:2]
+            return np.zeros((h, w), dtype=np.float32)
+        h_map = cv2.rotate(v_rot, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return h_map.astype(np.float32)
+
+    @staticmethod
+    def _image_canny_axis_maps(image_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        h, w = image_bgr.shape[:2]
+        if h < 2 or w < 2:
+            z = np.zeros((h, w), dtype=np.float32)
+            return z, z
+
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        den = cv2.bilateralFilter(gray, d=5, sigmaColor=35, sigmaSpace=35)
+        edge = cv2.Canny(den, 40, 130)
+
+        kx_long = max(15, int(round(0.030 * w)))
+        ky_long = max(15, int(round(0.030 * h)))
+        kx_small = max(9, int(round(0.012 * w)))
+        ky_small = max(9, int(round(0.012 * h)))
+        h_kernel_long = cv2.getStructuringElement(cv2.MORPH_RECT, (kx_long, 1))
+        v_kernel_long = cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky_long))
+        h_kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (kx_small, 1))
+        v_kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky_small))
+
+        h_long = cv2.morphologyEx(edge, cv2.MORPH_OPEN, h_kernel_long, iterations=1)
+        v_long = cv2.morphologyEx(edge, cv2.MORPH_OPEN, v_kernel_long, iterations=1)
+        h_small = cv2.morphologyEx(edge, cv2.MORPH_OPEN, h_kernel_small, iterations=1)
+        v_small = cv2.morphologyEx(edge, cv2.MORPH_OPEN, v_kernel_small, iterations=1)
+
+        h_map = cv2.bitwise_or(h_long, h_small)
+        v_map = cv2.bitwise_or(v_long, v_small)
+        h_map = cv2.morphologyEx(h_map, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+        v_map = cv2.morphologyEx(v_map, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+        h_map = cv2.dilate(h_map, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+        v_map = cv2.dilate(v_map, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+
+        hf = (h_map.astype(np.float32) / 255.0).astype(np.float32)
+        vf = (v_map.astype(np.float32) / 255.0).astype(np.float32)
+        return vf, hf
+
+    @staticmethod
+    def _smooth_int_sequence(vals: list[int], radius: int = 1) -> list[int]:
+        if not vals:
+            return []
+        arr = np.asarray(vals, dtype=np.float32)
+        if radius <= 0 or arr.size < 3:
+            return [int(round(v)) for v in arr.tolist()]
+        k = int(2 * radius + 1)
+        ker = np.ones((k,), dtype=np.float32) / float(k)
+        pad = np.pad(arr, (radius, radius), mode="edge")
+        sm = np.convolve(pad, ker, mode="valid")
+        return [int(round(v)) for v in sm.tolist()]
+
+    def _fit_vertical_polylines(
+        self,
+        x_lines: list[int],
+        y_lines: list[int],
+        v_prob: np.ndarray,
+        v_line_prob: Optional[np.ndarray] = None,
+    ) -> list[list[list[int]]]:
+        if len(x_lines) < 2 or len(y_lines) < 2:
+            return [[[int(x), int(y_lines[0])], [int(x), int(y_lines[-1])]] for x in x_lines]
+        h, w = v_prob.shape[:2]
+        vmap = v_prob
+        if v_line_prob is not None and v_line_prob.shape[:2] == v_prob.shape[:2]:
+            vmap = np.maximum(vmap, 0.90 * v_line_prob)
+
+        yk = [int(np.clip(y, 0, h - 1)) for y in y_lines]
+        step_med = float(np.median(np.diff(np.array(yk, dtype=np.float32)))) if len(yk) >= 3 else float(max(8, h // 20))
+        yband = max(2, int(round(0.18 * max(4.0, step_med))))
+        xband = max(1, int(round(0.18 * max(6.0, float(np.median(np.diff(np.array(sorted(x_lines), dtype=np.float32))) if len(x_lines) >= 3 else 24.0)))))
+        xsearch = max(3, int(round(0.55 * xband)))
+
+        out: list[list[list[int]]] = []
+        for xb in x_lines:
+            base_x = int(np.clip(xb, 0, w - 1))
+            xs: list[int] = []
+            prev_x = base_x
+            for yy in yk:
+                lo = max(0, min(base_x - 2 * xsearch, prev_x - xsearch))
+                hi = min(w - 1, max(base_x + 2 * xsearch, prev_x + xsearch))
+                best_x = prev_x
+                best_s = -1e18
+                y0 = max(0, yy - yband)
+                y1 = min(h - 1, yy + yband)
+                for xx in range(lo, hi + 1):
+                    x0 = max(0, xx - xband)
+                    x1 = min(w - 1, xx + xband)
+                    patch = vmap[y0 : y1 + 1, x0 : x1 + 1]
+                    if patch.size == 0:
+                        continue
+                    s = 0.72 * float(np.max(patch)) + 0.28 * float(np.mean(patch))
+                    s -= 0.0045 * abs(xx - prev_x)
+                    s -= 0.0018 * abs(xx - base_x)
+                    if s > best_s:
+                        best_s = s
+                        best_x = xx
+                prev_x = int(best_x)
+                xs.append(prev_x)
+            xs = self._smooth_int_sequence(xs, radius=1)
+            out.append([[int(np.clip(x, 0, w - 1)), int(y)] for x, y in zip(xs, yk)])
+        return out
+
+    def _fit_horizontal_polylines(
+        self,
+        x_lines: list[int],
+        y_lines: list[int],
+        h_prob: np.ndarray,
+        h_color_prob: Optional[np.ndarray] = None,
+        h_line_prob: Optional[np.ndarray] = None,
+    ) -> list[list[list[int]]]:
+        if len(x_lines) < 2 or len(y_lines) < 2:
+            return [[[int(x_lines[0]), int(y)], [int(x_lines[-1]), int(y)]] for y in y_lines]
+        h, w = h_prob.shape[:2]
+        hmap = h_prob
+        if h_color_prob is not None and h_color_prob.shape[:2] == h_prob.shape[:2]:
+            hmap = np.maximum(hmap, 0.86 * h_color_prob)
+        if h_line_prob is not None and h_line_prob.shape[:2] == h_prob.shape[:2]:
+            hmap = np.maximum(hmap, 0.90 * h_line_prob)
+
+        xk = [int(np.clip(x, 0, w - 1)) for x in x_lines]
+        step_med = float(np.median(np.diff(np.array(xk, dtype=np.float32)))) if len(xk) >= 3 else float(max(8, w // 20))
+        xband = max(2, int(round(0.18 * max(4.0, step_med))))
+        yband = max(1, int(round(0.18 * max(6.0, float(np.median(np.diff(np.array(sorted(y_lines), dtype=np.float32))) if len(y_lines) >= 3 else 24.0)))))
+        ysearch = max(3, int(round(0.55 * yband)))
+
+        out: list[list[list[int]]] = []
+        for yb in y_lines:
+            base_y = int(np.clip(yb, 0, h - 1))
+            ys: list[int] = []
+            prev_y = base_y
+            for xx in xk:
+                lo = max(0, min(base_y - 2 * ysearch, prev_y - ysearch))
+                hi = min(h - 1, max(base_y + 2 * ysearch, prev_y + ysearch))
+                best_y = prev_y
+                best_s = -1e18
+                x0 = max(0, xx - xband)
+                x1 = min(w - 1, xx + xband)
+                for yy in range(lo, hi + 1):
+                    y0 = max(0, yy - yband)
+                    y1 = min(h - 1, yy + yband)
+                    patch = hmap[y0 : y1 + 1, x0 : x1 + 1]
+                    if patch.size == 0:
+                        continue
+                    s = 0.72 * float(np.max(patch)) + 0.28 * float(np.mean(patch))
+                    s -= 0.0045 * abs(yy - prev_y)
+                    s -= 0.0018 * abs(yy - base_y)
+                    if s > best_s:
+                        best_s = s
+                        best_y = yy
+                prev_y = int(best_y)
+                ys.append(prev_y)
+            ys = self._smooth_int_sequence(ys, radius=1)
+            out.append([[int(x), int(np.clip(y, 0, h - 1))] for x, y in zip(xk, ys)])
+        return out
+
+    @staticmethod
     def _prob_contrast(prob: np.ndarray) -> float:
         if prob.size == 0:
             return 0.0
@@ -1039,6 +1210,19 @@ class GridDecoder:
         if mask_comb.max() <= 0 and mask_line.max() <= 0:
             return []
 
+        # Adaptive "strong line" thresholds for table-candidate scoring.
+        # Fixed high cutoffs (e.g., 0.52) are too strict when a model head is
+        # calibrated lower but still encodes useful relative structure.
+        vp99 = float(np.percentile(v_prob, 99.5)) if v_prob.size else 0.0
+        hp99 = float(np.percentile(h_prob, 99.5)) if h_prob.size else 0.0
+        base_hi = max(0.22, float(self.cfg.line_thresh) + 0.02)
+        v_hi = min(0.48, base_hi)
+        h_hi = min(0.48, base_hi)
+        if vp99 > 1e-6:
+            v_hi = min(v_hi, max(0.12, 0.92 * vp99))
+        if hp99 > 1e-6:
+            h_hi = min(h_hi, max(0.12, 0.92 * hp99))
+
         def _prep_mask(mask_u8: np.ndarray, line_only: bool) -> np.ndarray:
             if mask_u8.max() <= 0:
                 return mask_u8
@@ -1075,8 +1259,8 @@ class GridDecoder:
                 crop_v = v_prob[y0 : y1 + 1, x0 : x1 + 1]
                 crop_h = h_prob[y0 : y1 + 1, x0 : x1 + 1]
                 line_energy = 0.5 * (
-                    self._strong_ratio(crop_v, max(0.52, self.cfg.line_thresh + 0.06))
-                    + self._strong_ratio(crop_h, max(0.52, self.cfg.line_thresh + 0.06))
+                    self._strong_ratio(crop_v, v_hi)
+                    + self._strong_ratio(crop_h, h_hi)
                 )
                 fill = float(area) / float(max(1, bw * bh))
                 if (not line_only) and fill > float(self.cfg.max_component_fill_ratio) and line_energy < max(
@@ -1086,10 +1270,23 @@ class GridDecoder:
                 if line_energy < float(self.cfg.min_box_line_energy):
                     continue
                 energy = float(crop_v.mean() + crop_h.mean())
+                table_crop = table_prob[y0 : y1 + 1, x0 : x1 + 1]
+                t_mean = float(np.mean(table_crop)) if table_crop.size else 0.0
+                t_p90 = float(np.percentile(table_crop, 90.0)) if table_crop.size else 0.0
+                ar = float(max(1, bw * bh)) / float(max(1, h * w))
                 # In line-only mode, favor line support more than component fill/area.
                 area_w = 0.50 if line_only else 0.90
                 line_w = 2.25 if line_only else 1.15
                 score = float(area) * (area_w + line_w * max(line_energy, 0.0) + 0.50 * energy) * (0.40 + 0.90 * fill)
+                score *= float(0.55 + 0.80 * t_mean + 0.40 * t_p90)
+                # Penalize near-full-frame boxes unless table-confidence support is
+                # extremely high. This protects cards like White Horse from
+                # over-expanding to page-wide line structures.
+                if ar > 0.86 and t_p90 < 0.88:
+                    score *= float(max(0.15, 1.0 - 1.8 * (ar - 0.86)))
+                if bool(self.cfg.conservative_table_bbox):
+                    compact = 1.0 - ar
+                    score *= float(1.0 + float(self.cfg.conservative_prefer_compact_bonus) * max(0.0, compact))
                 out.append((score, (x0, y0, x1, y1), fill))
             return out
 
@@ -1102,7 +1299,7 @@ class GridDecoder:
         elif cands and cands_line:
             # If combined mask is dominated by near-full components, prefer line-only candidates.
             top_fill = max(float(c[2]) for c in cands)
-            if top_fill >= min(0.995, float(self.cfg.max_component_fill_ratio) + 0.01):
+            if top_fill >= min(0.995, float(self.cfg.max_component_fill_ratio) + 0.01) and not bool(self.cfg.conservative_table_bbox):
                 cands = cands_line
             else:
                 # Also allow extra non-overlapping line-only candidates.
@@ -1118,11 +1315,27 @@ class GridDecoder:
         cands.sort(key=lambda t: t[0], reverse=True)
         chosen: list[tuple[int, int, int, int]] = []
         for _, box, _ in cands:
+            if bool(self.cfg.conservative_table_bbox):
+                x0, y0, x1, y1 = box
+                bw = x1 - x0 + 1
+                bh = y1 - y0 + 1
+                if float(bw) / float(max(1, w)) > float(self.cfg.conservative_max_width_ratio):
+                    continue
+                if float(bh) / float(max(1, h)) > float(self.cfg.conservative_max_height_ratio):
+                    continue
             if any(_bbox_iou_xyxy(box, c) > 0.45 for c in chosen):
                 continue
             chosen.append(box)
             if len(chosen) >= int(self.cfg.max_tables):
                 break
+        if not chosen and bool(self.cfg.conservative_table_bbox):
+            # Conservative pass may filter everything; gracefully fallback.
+            for _, box, _ in cands:
+                if any(_bbox_iou_xyxy(box, c) > 0.45 for c in chosen):
+                    continue
+                chosen.append(box)
+                if len(chosen) >= int(self.cfg.max_tables):
+                    break
         if not chosen:
             return []
         chosen.sort(key=lambda b: (b[0], b[1]))
@@ -2689,6 +2902,111 @@ class GridDecoder:
             return x_lines
         return xs
 
+    def _resnap_vertical_lines_by_segments(
+        self,
+        x_lines: list[int],
+        y_lines: list[int],
+        v_prob_crop: np.ndarray,
+        line_thr: float,
+        v_line_crop: Optional[np.ndarray] = None,
+    ) -> list[int]:
+        # Final position cleanup: maximize true line evidence per row-segment.
+        # This reduces persistent x-offset drift that later causes missed/false
+        # vertical segment decisions in merged/footer regions.
+        if v_line_crop is None or v_line_crop.shape[:2] != v_prob_crop.shape[:2]:
+            return x_lines
+        if len(x_lines) < 3 or len(y_lines) < 2:
+            return x_lines
+
+        h, w = v_prob_crop.shape[:2]
+        rows = max(0, len(y_lines) - 1)
+        if h < 4 or w < 4 or rows <= 0:
+            return x_lines
+
+        xs = sorted(set(int(v) for v in x_lines))
+        if len(xs) < 3:
+            return x_lines
+
+        min_gap = max(6, int(self.cfg.min_gap_px))
+        band = max(2, int(self.cfg.flexible_band_px))
+        sband = max(1, int(round(0.45 * float(band))))
+        thr = max(0.20, float(line_thr) * 0.90)
+        row_heights = np.diff(np.array(y_lines, dtype=np.int32)).astype(np.float32)
+        med_h = float(np.median(row_heights)) if row_heights.size else 1.0
+        med_h = max(1.0, med_h)
+
+        for i in range(1, len(xs) - 1):
+            x0 = int(xs[i])
+            gl = int(xs[i] - xs[i - 1])
+            gr = int(xs[i + 1] - xs[i])
+            win = max(4, int(round(0.20 * float(max(gl, gr)))))
+            lo = max(int(xs[i - 1]) + 2, x0 - win)
+            hi = min(int(xs[i + 1]) - 2, x0 + win)
+            if hi <= lo:
+                continue
+
+            picks: list[tuple[int, float]] = []
+            for r in range(rows):
+                y0 = int(y_lines[r])
+                y1 = int(y_lines[r + 1])
+                if y1 <= y0:
+                    continue
+                row_h = float(y1 - y0)
+                best_p = x0
+                best_s = -1e18
+                best_lcov = 0.0
+                best_lrun = 0.0
+                for p in range(lo, hi + 1):
+                    cov = self._flex_cov_vertical(v_prob_crop, x=p, band=sband, thr=thr, y0=y0, y1=y1)
+                    xw0 = max(0, p - sband)
+                    xw1 = min(w - 1, p + sband)
+                    seg = (
+                        np.max(v_prob_crop[y0:y1, xw0 : xw1 + 1], axis=1) >= thr
+                    ) if (xw1 >= xw0 and y1 > y0) else np.zeros((0,), dtype=np.uint8)
+                    run = _max_true_run_ratio(seg)
+
+                    lcov = self._flex_cov_vertical(v_line_crop, x=p, band=sband, thr=0.35, y0=y0, y1=y1)
+                    lseg = (
+                        np.max(v_line_crop[y0:y1, xw0 : xw1 + 1], axis=1) >= 0.35
+                    ) if (xw1 >= xw0 and y1 > y0) else np.zeros((0,), dtype=np.uint8)
+                    lrun = _max_true_run_ratio(lseg)
+
+                    s = float(
+                        0.22 * cov
+                        + 0.10 * run
+                        + 0.40 * lcov
+                        + 0.28 * lrun
+                        - 0.0011 * abs(p - x0)
+                    )
+                    if s > best_s:
+                        best_s = s
+                        best_p = int(p)
+                        best_lcov = float(lcov)
+                        best_lrun = float(lrun)
+
+                min_row_s = 0.22 if row_h >= 0.78 * med_h else 0.25
+                if best_s >= min_row_s and (best_lcov >= 0.20 or best_lrun >= 0.48):
+                    wt = float(max(0.0, best_s - 0.12))
+                    wt *= float(np.clip(row_h / med_h, 0.70, 1.35))
+                    if wt > 0.0:
+                        picks.append((int(best_p), wt))
+
+            need = max(3, int(round(0.34 * float(rows))))
+            if len(picks) < need:
+                continue
+            pw = np.array([p[0] for p in picks], dtype=np.float32)
+            ww = np.array([max(1e-4, p[1]) for p in picks], dtype=np.float32)
+            new_x = int(round(float(np.sum(pw * ww) / np.sum(ww))))
+            move_cap = max(2, int(round(0.36 * float(max(gl, gr)))))
+            if abs(new_x - x0) > move_cap:
+                new_x = int(np.clip(new_x, x0 - move_cap, x0 + move_cap))
+            xs[i] = int(np.clip(new_x, xs[i - 1] + 1, xs[i + 1] - 1))
+
+        xs = _prune_near(sorted(set(xs)), max(2, int(round(0.58 * min_gap))))
+        if len(xs) < 2:
+            return x_lines
+        return xs
+
     def _decode_best_lines(
         self,
         v_prob: np.ndarray,
@@ -2857,6 +3175,13 @@ class GridDecoder:
             y_lines=best_y,
             v_prob_crop=v_crop,
             j_prob_crop=j_crop,
+            line_thr=best_thr,
+            v_line_crop=v_line_crop,
+        )
+        best_x = self._resnap_vertical_lines_by_segments(
+            x_lines=best_x,
+            y_lines=best_y,
+            v_prob_crop=v_crop,
             line_thr=best_thr,
             v_line_crop=v_line_crop,
         )
@@ -3059,6 +3384,37 @@ class GridDecoder:
                         erun = float(row_lrun[r, i]) if has_line_map else float(row_crun[r, i])
                         if ecov < 0.36 or erun < 0.84:
                             out[r, i] = 0
+
+                # Continuity repair/veto across rows:
+                # 1) Fill a single-row break when neighbors are present and local
+                # evidence is adequate.
+                # 2) Remove isolated one-off segments unless local evidence is strong.
+                if rows >= 3:
+                    for i in range(1, nvl - 1):
+                        for r in range(rows):
+                            up = bool(r > 0 and out[r - 1, i] > 0)
+                            dn = bool((r + 1) < rows and out[r + 1, i] > 0)
+                            ecov = float(row_lcov[r, i]) if has_line_map else float(row_ccov[r, i])
+                            erun = float(row_lrun[r, i]) if has_line_map else float(row_crun[r, i])
+
+                            if out[r, i] == 0 and up and dn:
+                                fill_cov = 0.24 if has_line_map else 0.28
+                                fill_run = 0.54 if has_line_map else 0.58
+                                if ecov >= fill_cov and erun >= fill_run:
+                                    out[r, i] = 1
+                                continue
+
+                            if out[r, i] == 0:
+                                continue
+
+                            if (not up) and (not dn):
+                                iso_cov = 0.34 if has_line_map else 0.38
+                                iso_run = 0.74 if has_line_map else 0.78
+                                if r == (rows - 1):
+                                    iso_cov = max(iso_cov, 0.38 if has_line_map else 0.42)
+                                    iso_run = max(iso_run, 0.84 if has_line_map else 0.86)
+                                if ecov < iso_cov or erun < iso_run:
+                                    out[r, i] = 0
         return out
 
     def _horizontal_presence(
@@ -3189,6 +3545,11 @@ class GridDecoder:
                 right_gap = float(x_lines[-1] - x_lines[-2])
                 left_trim_ok = left_gap <= keep_large_outer_ratio * x_med
                 right_trim_ok = right_gap <= keep_large_outer_ratio * x_med
+                if bool(self.cfg.conservative_table_bbox):
+                    if left_cov < 0.50 * min_cov:
+                        left_trim_ok = True
+                    if right_cov < 0.50 * min_cov:
+                        right_trim_ok = True
                 if left_cov < min_cov and left_cov <= right_cov and left_trim_ok:
                     x_lines = x_lines[1:]
                     dropped = True
@@ -3238,42 +3599,94 @@ class GridDecoder:
         j_prob: np.ndarray,
         image_bgr: Optional[np.ndarray] = None,
     ) -> list[DecodedGrid]:
-        # Keep hard line decoding on raw model outputs.
+        # Raw model maps.
         v_hard = v_prob
         h_hard = h_prob
         v_col: Optional[np.ndarray] = None
         v_line: Optional[np.ndarray] = None
         h_col: Optional[np.ndarray] = None
+        h_line: Optional[np.ndarray] = None
+        v_canny: Optional[np.ndarray] = None
+        h_canny: Optional[np.ndarray] = None
         if bool(self.cfg.color_edge_enable) and image_bgr is not None:
             if image_bgr.shape[:2] == v_prob.shape[:2]:
                 v_col, h_col = self._color_transition_maps(image_bgr)
                 v_line = self._image_vertical_line_evidence_map(image_bgr)
+                h_line = self._image_horizontal_line_evidence_map(image_bgr)
+                v_canny, h_canny = self._image_canny_axis_maps(image_bgr)
+
+        if bool(self.cfg.legacy_decode):
+            v_dec = v_hard
+            h_dec = h_hard
+            v_line_fused = None
+            h_line_fused = None
+            h_soft = None
+            j_dec = j_prob
+            v_box = v_dec
+            h_box = h_dec
+        else:
+            # Evidence-fused decode maps:
+            # when model logits are under-confident, keep line evidence from image
+            # transitions so table/grid decoding does not collapse to zero tables.
+            v_dec = v_hard
+            h_dec = h_hard
+            v_line_fused = v_line
+            h_line_fused = h_line
+            if v_canny is not None and v_canny.shape[:2] == v_hard.shape[:2]:
+                v_dec = np.maximum(v_dec, 0.90 * v_canny)
+                v_line_fused = v_canny if v_line_fused is None else np.maximum(v_line_fused, 0.88 * v_canny)
+            if h_canny is not None and h_canny.shape[:2] == h_hard.shape[:2]:
+                h_dec = np.maximum(h_dec, 0.90 * h_canny)
+                h_line_fused = h_canny if h_line_fused is None else np.maximum(h_line_fused, 0.88 * h_canny)
+            if v_line is not None and v_line.shape[:2] == v_hard.shape[:2]:
+                v_dec = np.maximum(v_dec, 0.86 * v_line)
+            if h_col is not None and h_col.shape[:2] == h_hard.shape[:2]:
+                h_dec = np.maximum(h_dec, 0.84 * h_col)
+            if h_line is not None and h_line.shape[:2] == h_hard.shape[:2]:
+                h_dec = np.maximum(h_dec, 0.88 * h_line)
+            h_soft = h_col
+            if h_line_fused is not None and h_line_fused.shape[:2] == h_hard.shape[:2]:
+                h_soft = h_line_fused if h_soft is None else np.maximum(h_soft, 0.82 * h_line_fused)
+            j_dec = j_prob
+            if v_dec.shape[:2] == h_dec.shape[:2]:
+                j_synth = cv2.GaussianBlur((v_dec * h_dec).astype(np.float32), (5, 5), 0)
+                j_con = self._prob_contrast(j_prob)
+                if j_con < max(0.035, 0.75 * float(self.cfg.min_line_prob_contrast)):
+                    j_dec = np.maximum(j_prob, j_synth)
+                else:
+                    j_dec = np.maximum(j_prob, 0.55 * j_synth)
+            v_box = v_dec
+            h_box = h_dec
 
         h_all, w_all = table_prob.shape[:2]
-        # Keep table localization stable on raw model outputs.
-        boxes = self._decode_table_bboxes(table_prob, v_hard, h_hard)
+        boxes = self._decode_table_bboxes(table_prob, v_box, h_box)
         out: list[DecodedGrid] = []
         for tid, box in enumerate(boxes):
             x0, y0, x1, y1 = box
             if x1 <= x0 or y1 <= y0:
                 continue
-            v_crop = v_hard[y0 : y1 + 1, x0 : x1 + 1]
-            h_crop = h_hard[y0 : y1 + 1, x0 : x1 + 1]
+            v_crop = v_dec[y0 : y1 + 1, x0 : x1 + 1]
+            h_crop = h_dec[y0 : y1 + 1, x0 : x1 + 1]
             if max(self._prob_contrast(v_crop), self._prob_contrast(h_crop)) < self.cfg.min_line_prob_contrast:
                 continue
 
             x_lines, y_lines, line_thr, grid_score = self._decode_best_lines(
-                v_hard,
-                h_hard,
-                j_prob,
+                v_dec,
+                h_dec,
+                j_dec,
                 box,
-                h_color_prob=h_col,
-                v_line_prob=v_line,
+                h_color_prob=h_soft,
+                v_line_prob=v_line_fused,
             )
             if grid_score < float(self.cfg.min_grid_score):
                 continue
 
-            x_lines, y_lines = self._trim_weak_outer_lines(v_hard, h_hard, x_lines, y_lines, line_thr=line_thr)
+            # Conservative mode: use raw vertical head for outer x-border trim
+            # (reduces page-wide expansion), but keep fused horizontal evidence
+            # so row structure does not collapse.
+            trim_v = v_hard if bool(self.cfg.conservative_table_bbox) else v_dec
+            trim_h = h_dec
+            x_lines, y_lines = self._trim_weak_outer_lines(trim_v, trim_h, x_lines, y_lines, line_thr=line_thr)
             if len(x_lines) < 2 or len(y_lines) < 2:
                 continue
             cols_final = max(0, len(x_lines) - 1)
@@ -3288,14 +3701,27 @@ class GridDecoder:
                 y_lines,
                 line_thr=line_thr,
                 v_color_prob=v_col,
-                v_line_prob=v_line,
+                v_line_prob=v_line_fused,
             )
             h_pres = self._horizontal_presence(
                 h_hard,
                 x_lines,
                 y_lines,
                 line_thr=line_thr,
-                h_color_prob=h_col,
+                h_color_prob=h_soft,
+            )
+            v_polys = self._fit_vertical_polylines(
+                x_lines=x_lines,
+                y_lines=y_lines,
+                v_prob=v_dec,
+                v_line_prob=v_line_fused,
+            )
+            h_polys = self._fit_horizontal_polylines(
+                x_lines=x_lines,
+                y_lines=y_lines,
+                h_prob=h_dec,
+                h_color_prob=h_soft,
+                h_line_prob=h_line_fused,
             )
             # Tight bbox from inferred outer grid lines (not coarse component bounds).
             if x_lines and y_lines:
@@ -3315,14 +3741,97 @@ class GridDecoder:
                     y_lines=y_lines,
                     v_presence=v_pres,
                     h_presence=h_pres,
+                    v_polylines=v_polys,
+                    h_polylines=h_polys,
                 )
             )
+        if not out and bool(self.cfg.conservative_table_bbox):
+            # Safety fallback: if conservative localization over-prunes and no
+            # table survives, fall back to standard decode.
+            fb_cfg = replace(
+                self.cfg,
+                conservative_table_bbox=False,
+            )
+            return GridDecoder(fb_cfg).decode_all(table_prob, v_prob, h_prob, j_prob, image_bgr=image_bgr)
         return out
 
 
 # -----------------------------------------------------------------------------
 # Cell extraction
 # -----------------------------------------------------------------------------
+
+
+def _interp_poly_x_at_y(poly: list[list[int]], y: float) -> float:
+    if not poly:
+        return 0.0
+    if len(poly) == 1:
+        return float(poly[0][0])
+    pts = sorted(poly, key=lambda p: p[1])
+    yy = float(y)
+    if yy <= float(pts[0][1]):
+        return float(pts[0][0])
+    if yy >= float(pts[-1][1]):
+        return float(pts[-1][0])
+    for i in range(len(pts) - 1):
+        x0, y0 = float(pts[i][0]), float(pts[i][1])
+        x1, y1 = float(pts[i + 1][0]), float(pts[i + 1][1])
+        if y1 <= y0:
+            continue
+        if y0 <= yy <= y1:
+            t = (yy - y0) / max(1e-6, (y1 - y0))
+            return x0 + t * (x1 - x0)
+    return float(pts[-1][0])
+
+
+def _interp_poly_y_at_x(poly: list[list[int]], x: float) -> float:
+    if not poly:
+        return 0.0
+    if len(poly) == 1:
+        return float(poly[0][1])
+    pts = sorted(poly, key=lambda p: p[0])
+    xx = float(x)
+    if xx <= float(pts[0][0]):
+        return float(pts[0][1])
+    if xx >= float(pts[-1][0]):
+        return float(pts[-1][1])
+    for i in range(len(pts) - 1):
+        x0, y0 = float(pts[i][0]), float(pts[i][1])
+        x1, y1 = float(pts[i + 1][0]), float(pts[i + 1][1])
+        if x1 <= x0:
+            continue
+        if x0 <= xx <= x1:
+            t = (xx - x0) / max(1e-6, (x1 - x0))
+            return y0 + t * (y1 - y0)
+    return float(pts[-1][1])
+
+
+def _intersect_vh_polys(v_poly: list[list[int]], h_poly: list[list[int]], x0: float, y0: float) -> tuple[float, float]:
+    x = float(x0)
+    y = float(y0)
+    for _ in range(6):
+        x = _interp_poly_x_at_y(v_poly, y)
+        y = _interp_poly_y_at_x(h_poly, x)
+    return float(x), float(y)
+
+
+def _build_intersection_grid(
+    x_lines: list[int],
+    y_lines: list[int],
+    v_polylines: Optional[list[list[list[int]]]],
+    h_polylines: Optional[list[list[list[int]]]],
+) -> Optional[list[list[tuple[float, float]]]]:
+    if v_polylines is None or h_polylines is None:
+        return None
+    if len(v_polylines) != len(x_lines) or len(h_polylines) != len(y_lines):
+        return None
+    out: list[list[tuple[float, float]]] = []
+    for r, y in enumerate(y_lines):
+        row: list[tuple[float, float]] = []
+        for c, x in enumerate(x_lines):
+            px, py = _intersect_vh_polys(v_polylines[c], h_polylines[r], x0=float(x), y0=float(y))
+            row.append((float(px), float(py)))
+        out.append(row)
+    return out
 
 
 def extract_cells_from_decoded(image_bgr: np.ndarray, dec: DecodedGrid, output_dir: Path, cfg: InferConfig) -> dict:
@@ -3333,33 +3842,87 @@ def extract_cells_from_decoded(image_bgr: np.ndarray, dec: DecodedGrid, output_d
     cols = max(0, len(x_lines) - 1)
     img_h, img_w = image_bgr.shape[:2]
     inset = max(0, int(cfg.cell_inset_px))
+    grid_pts = _build_intersection_grid(x_lines, y_lines, dec.v_polylines, dec.h_polylines)
+
+    def _crop_quad(
+        quad_xy: list[tuple[float, float]],
+        min_w: int,
+        min_h: int,
+    ) -> tuple[Optional[np.ndarray], list[int], list[list[float]]]:
+        q = np.asarray(quad_xy, dtype=np.float32).reshape(4, 2)
+        q[:, 0] = np.clip(q[:, 0], 0.0, float(max(0, img_w - 1)))
+        q[:, 1] = np.clip(q[:, 1], 0.0, float(max(0, img_h - 1)))
+        x0 = int(max(0, min(img_w, int(np.floor(np.min(q[:, 0]))))))
+        x1 = int(max(0, min(img_w, int(np.ceil(np.max(q[:, 0])) + 1))))
+        y0 = int(max(0, min(img_h, int(np.floor(np.min(q[:, 1]))))))
+        y1 = int(max(0, min(img_h, int(np.ceil(np.max(q[:, 1])) + 1))))
+        bbox = [x0, y0, x1, y1]
+        if (x1 - x0) <= 1 or (y1 - y0) <= 1:
+            return None, bbox, q.astype(np.float32).tolist()
+
+        w_top = float(np.linalg.norm(q[1] - q[0]))
+        w_bot = float(np.linalg.norm(q[2] - q[3]))
+        h_left = float(np.linalg.norm(q[3] - q[0]))
+        h_right = float(np.linalg.norm(q[2] - q[1]))
+        tw = int(round(max(2.0, 0.5 * (w_top + w_bot))))
+        th = int(round(max(2.0, 0.5 * (h_left + h_right))))
+        if tw < int(max(2, min_w)) or th < int(max(2, min_h)):
+            return None, bbox, q.astype(np.float32).tolist()
+
+        dst = np.array(
+            [[0.0, 0.0], [float(tw - 1), 0.0], [float(tw - 1), float(th - 1)], [0.0, float(th - 1)]],
+            dtype=np.float32,
+        )
+        m = cv2.getPerspectiveTransform(q, dst)
+        patch = cv2.warpPerspective(
+            image_bgr,
+            m,
+            (tw, th),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        if inset > 0 and patch is not None and patch.size > 0 and patch.shape[0] > 2 * inset + 2 and patch.shape[1] > 2 * inset + 2:
+            patch = patch[inset : patch.shape[0] - inset, inset : patch.shape[1] - inset]
+        return patch, bbox, q.astype(np.float32).tolist()
 
     # Base matrix cells: always emitted row-major for OCR.
     base_cells: list[dict] = []
     matrix_base: list[list[dict]] = [[{} for _ in range(cols)] for _ in range(rows)]
     for r in range(rows):
         for c in range(cols):
-            x0 = int(x_lines[c])
-            x1 = int(x_lines[c + 1])
-            y0 = int(y_lines[r])
-            y1 = int(y_lines[r + 1])
-
-            cx0 = max(0, min(img_w, x0 + inset))
-            cx1 = max(0, min(img_w, x1 - inset))
-            cy0 = max(0, min(img_h, y0 + inset))
-            cy1 = max(0, min(img_h, y1 - inset))
-            if cx1 <= cx0:
-                cx0, cx1 = max(0, min(img_w, x0)), max(0, min(img_w, x1))
-            if cy1 <= cy0:
-                cy0, cy1 = max(0, min(img_h, y0)), max(0, min(img_h, y1))
-
+            cx0, cx1 = int(x_lines[c]), int(x_lines[c + 1])
+            cy0, cy1 = int(y_lines[r]), int(y_lines[r + 1])
+            quad_pts: Optional[list[list[float]]] = None
+            patch: Optional[np.ndarray] = None
+            if grid_pts is not None:
+                tl = grid_pts[r][c]
+                tr = grid_pts[r][c + 1]
+                br = grid_pts[r + 1][c + 1]
+                bl = grid_pts[r + 1][c]
+                patch, bbox, quad_pts = _crop_quad([tl, tr, br, bl], min_w=2, min_h=2)
+                cx0, cy0, cx1, cy1 = bbox
+            else:
+                cx0 = max(0, min(img_w, cx0 + inset))
+                cx1 = max(0, min(img_w, cx1 - inset))
+                cy0 = max(0, min(img_h, cy0 + inset))
+                cy1 = max(0, min(img_h, cy1 - inset))
+                if cx1 <= cx0:
+                    cx0, cx1 = max(0, min(img_w, int(x_lines[c]))), max(0, min(img_w, int(x_lines[c + 1])))
+                if cy1 <= cy0:
+                    cy0, cy1 = max(0, min(img_h, int(y_lines[r]))), max(0, min(img_h, int(y_lines[r + 1])))
             path = None
-            if cx1 > cx0 and cy1 > cy0:
-                cell = image_bgr[cy0:cy1, cx0:cx1]
-                if cell.size > 0:
+            if grid_pts is not None:
+                if patch is not None and patch.size > 0:
                     p = output_dir / f"base_r{r:02d}_c{c:02d}.png"
-                    cv2.imwrite(str(p), cell)
+                    cv2.imwrite(str(p), patch)
                     path = p.name
+            else:
+                if cx1 > cx0 and cy1 > cy0:
+                    cell = image_bgr[cy0:cy1, cx0:cx1]
+                    if cell.size > 0:
+                        p = output_dir / f"base_r{r:02d}_c{c:02d}.png"
+                        cv2.imwrite(str(p), cell)
+                        path = p.name
 
             base_id = int(r * cols + c)
             rec = {
@@ -3369,12 +3932,16 @@ def extract_cells_from_decoded(image_bgr: np.ndarray, dec: DecodedGrid, output_d
                 "bbox_xyxy": [int(cx0), int(cy0), int(cx1), int(cy1)],
                 "path": path,
             }
+            if quad_pts is not None:
+                rec["quad_xy"] = [[float(v[0]), float(v[1])] for v in quad_pts]
             base_cells.append(rec)
             matrix_base[r][c] = {
                 "base_cell_id": base_id,
                 "base_bbox_xyxy": [int(cx0), int(cy0), int(cx1), int(cy1)],
                 "base_path": path,
             }
+            if quad_pts is not None:
+                matrix_base[r][c]["base_quad_xy"] = [[float(v[0]), float(v[1])] for v in quad_pts]
 
     parent = list(range(rows * cols))
 
@@ -3419,36 +3986,50 @@ def extract_cells_from_decoded(image_bgr: np.ndarray, dec: DecodedGrid, output_d
 
     cells = []
     for cid, (r0, c0, r1, c1) in enumerate(merged):
-        x0 = x_lines[c0]
-        x1 = x_lines[c1 + 1]
-        y0 = y_lines[r0]
-        y1 = y_lines[r1 + 1]
-
+        x0 = int(x_lines[c0])
+        x1 = int(x_lines[c1 + 1])
+        y0 = int(y_lines[r0])
+        y1 = int(y_lines[r1 + 1])
         cx0 = max(0, min(img_w, x0 + inset))
         cx1 = max(0, min(img_w, x1 - inset))
         cy0 = max(0, min(img_h, y0 + inset))
         cy1 = max(0, min(img_h, y1 - inset))
+        cell_patch: Optional[np.ndarray] = None
+        cell_quad: Optional[list[list[float]]] = None
+        if grid_pts is not None:
+            tl = grid_pts[r0][c0]
+            tr = grid_pts[r0][c1 + 1]
+            br = grid_pts[r1 + 1][c1 + 1]
+            bl = grid_pts[r1 + 1][c0]
+            cell_patch, bbox, cell_quad = _crop_quad([tl, tr, br, bl], min_w=int(cfg.min_cell_w), min_h=int(cfg.min_cell_h))
+            cx0, cy0, cx1, cy1 = bbox
 
         path = None
-        if cx1 > cx0 and cy1 > cy0 and (cx1 - cx0) >= cfg.min_cell_w and (cy1 - cy0) >= cfg.min_cell_h:
+        if grid_pts is not None:
+            if cell_patch is not None and cell_patch.size > 0:
+                p = output_dir / f"cell_{cid:04d}_r{r0:02d}_c{c0:02d}_rs{(r1-r0+1):02d}_cs{(c1-c0+1):02d}.png"
+                cv2.imwrite(str(p), cell_patch)
+                path = p.name
+        elif cx1 > cx0 and cy1 > cy0 and (cx1 - cx0) >= cfg.min_cell_w and (cy1 - cy0) >= cfg.min_cell_h:
             cell = image_bgr[cy0:cy1, cx0:cx1]
             if cell.size > 0:
                 p = output_dir / f"cell_{cid:04d}_r{r0:02d}_c{c0:02d}_rs{(r1-r0+1):02d}_cs{(c1-c0+1):02d}.png"
                 cv2.imwrite(str(p), cell)
                 path = p.name
 
-        cells.append(
-            {
-                "cell_id": cid,
-                "r0": r0,
-                "c0": c0,
-                "r1": r1,
-                "c1": c1,
-                "rowspan": r1 - r0 + 1,
-                "colspan": c1 - c0 + 1,
-                "path": path,
-            }
-        )
+        cmeta = {
+            "cell_id": cid,
+            "r0": r0,
+            "c0": c0,
+            "r1": r1,
+            "c1": c1,
+            "rowspan": r1 - r0 + 1,
+            "colspan": c1 - c0 + 1,
+            "path": path,
+        }
+        if cell_quad is not None:
+            cmeta["quad_xy"] = [[float(v[0]), float(v[1])] for v in cell_quad]
+        cells.append(cmeta)
 
     inv = {}
     for c in cells:
@@ -3483,6 +4064,8 @@ def extract_cells_from_decoded(image_bgr: np.ndarray, dec: DecodedGrid, output_d
         "bbox_xyxy": [int(v) for v in dec.bbox],
         "x_lines": [int(v) for v in dec.x_lines],
         "y_lines": [int(v) for v in dec.y_lines],
+        "v_polylines": dec.v_polylines if dec.v_polylines is not None else None,
+        "h_polylines": dec.h_polylines if dec.h_polylines is not None else None,
         "rows_base": rows,
         "cols_base": cols,
         "base_cells": base_cells,
@@ -3600,32 +4183,55 @@ def _run_one_with_model(
     for dec in decoded:
         x0, y0, x1, y1 = dec.bbox
         cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 220, 0), 2)
-        # Draw grid segments according to presence maps so merged cells are shown
-        # correctly (full-height/width lines are misleading for debug).
+        # Draw grid segments according to presence maps; prefer warped polyline
+        # intersections when available.
         rows = max(0, len(dec.y_lines) - 1)
         cols = max(0, len(dec.x_lines) - 1)
+        gpts = _build_intersection_grid(dec.x_lines, dec.y_lines, dec.v_polylines, dec.h_polylines)
 
         for i, x in enumerate(dec.x_lines):
             for r in range(rows):
                 if dec.v_presence.shape == (rows, len(dec.x_lines)):
                     if i < dec.v_presence.shape[1] and r < dec.v_presence.shape[0] and int(dec.v_presence[r, i]) == 0:
                         continue
-                ya = int(dec.y_lines[r])
-                yb = int(dec.y_lines[r + 1])
-                if yb <= ya:
-                    continue
-                cv2.line(overlay, (int(x), ya), (int(x), yb), (255, 80, 80), 1)
+                if gpts is not None:
+                    p0 = gpts[r][i]
+                    p1 = gpts[r + 1][i]
+                    cv2.line(
+                        overlay,
+                        (int(round(p0[0])), int(round(p0[1]))),
+                        (int(round(p1[0])), int(round(p1[1]))),
+                        (255, 80, 80),
+                        1,
+                    )
+                else:
+                    ya = int(dec.y_lines[r])
+                    yb = int(dec.y_lines[r + 1])
+                    if yb <= ya:
+                        continue
+                    cv2.line(overlay, (int(x), ya), (int(x), yb), (255, 80, 80), 1)
 
         for j, y in enumerate(dec.y_lines):
             for c in range(cols):
                 if dec.h_presence.shape == (len(dec.y_lines), cols):
                     if j < dec.h_presence.shape[0] and c < dec.h_presence.shape[1] and int(dec.h_presence[j, c]) == 0:
                         continue
-                xa = int(dec.x_lines[c])
-                xb = int(dec.x_lines[c + 1])
-                if xb <= xa:
-                    continue
-                cv2.line(overlay, (xa, int(y)), (xb, int(y)), (80, 80, 255), 1)
+                if gpts is not None:
+                    p0 = gpts[j][c]
+                    p1 = gpts[j][c + 1]
+                    cv2.line(
+                        overlay,
+                        (int(round(p0[0])), int(round(p0[1]))),
+                        (int(round(p1[0])), int(round(p1[1]))),
+                        (80, 80, 255),
+                        1,
+                    )
+                else:
+                    xa = int(dec.x_lines[c])
+                    xb = int(dec.x_lines[c + 1])
+                    if xb <= xa:
+                        continue
+                    cv2.line(overlay, (xa, int(y)), (xb, int(y)), (80, 80, 255), 1)
         cv2.putText(
             overlay,
             f"table_{dec.table_id:02d}",
