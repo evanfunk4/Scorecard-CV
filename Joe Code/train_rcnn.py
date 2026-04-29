@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import random
  
 import torch
 import torchvision
@@ -35,13 +36,10 @@ import torchvision.transforms.functional as TF
 # ---------------------------------------------------------------------------
  
 class ScorecardCellDataset(Dataset):
-    """
-    COCO-style dataset for scorecard grid-cell detection.
+    
  
-    One sample = one full scorecard image with all its cell bboxes.
-    """
- 
-    def __init__(self, data_dir: str) -> None:
+    def __init__(self, data_dir: str, augment: bool = False) -> None:
+        self.augment = augment
         data_path = Path(data_dir)
         ann_path = data_path / "annotations.json"
         img_dir = data_path / "images"
@@ -52,7 +50,6 @@ class ScorecardCellDataset(Dataset):
         self.img_dir = img_dir
         self.images = coco["images"]
  
-        # Build image_id → list of annotations lookup
         self._ann_by_image: dict[int, list[dict]] = {}
         for ann in coco["annotations"]:
             self._ann_by_image.setdefault(ann["image_id"], []).append(ann)
@@ -63,12 +60,9 @@ class ScorecardCellDataset(Dataset):
     def __getitem__(self, idx: int, max_side: int = 1333):
         img_meta = self.images[idx]
         img_id = img_meta["id"]
- 
+
         img = Image.open(self.img_dir / img_meta["file_name"]).convert("RGB")
- 
-        # Resize large images so the longest side <= max_side (default 1333px).
-        # This matches Faster R-CNN's built-in resize and prevents OOM errors
-        # on high-resolution scans. Bboxes are scaled by the same ratio.
+
         orig_w, orig_h = img.size
         scale = min(max_side / max(orig_w, orig_h), 1.0)
         if scale < 1.0:
@@ -77,33 +71,81 @@ class ScorecardCellDataset(Dataset):
             img = img.resize((new_w, new_h), Image.BILINEAR)
         else:
             scale = 1.0
- 
-        img_tensor = TF.to_tensor(img)  # [C, H, W] float in [0, 1]
- 
+
         anns = self._ann_by_image.get(img_id, [])
- 
+
         if anns:
-            # COCO bbox is [x, y, w, h] → scale → convert to [x1, y1, x2, y2]
             boxes = torch.tensor(
-                [[(a["bbox"][0])          * scale,
-                  (a["bbox"][1])          * scale,
-                  (a["bbox"][0] + a["bbox"][2]) * scale,
-                  (a["bbox"][1] + a["bbox"][3]) * scale] for a in anns],
+                [[(a["bbox"][0])                  * scale,
+                (a["bbox"][1])                  * scale,
+                (a["bbox"][0] + a["bbox"][2])   * scale,
+                (a["bbox"][1] + a["bbox"][3])   * scale] for a in anns],
                 dtype=torch.float32,
             )
-            labels = torch.ones(len(anns), dtype=torch.int64)  # class 1 = "cell"
+            labels = torch.ones(len(anns), dtype=torch.int64)
         else:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros(0, dtype=torch.int64)
- 
+
+        if self.augment:
+            img = TF.adjust_brightness(img, random.uniform(0.7, 1.3))
+            img = TF.adjust_contrast(img, random.uniform(0.8, 1.2))
+            img = TF.adjust_saturation(img, random.uniform(0.5, 1.5))
+            img = TF.adjust_hue(img, random.uniform(-0.08, 0.08))
+
+            if random.random() < 0.5:
+                img = TF.hflip(img)
+                img_w = img.width
+                if boxes.numel() > 0:
+                    flipped = boxes.clone()
+                    flipped[:, 0] = img_w - boxes[:, 2]
+                    flipped[:, 2] = img_w - boxes[:, 0]
+                    boxes = flipped
+
+            
+            if random.random() < 0.3:
+                img = TF.vflip(img)
+                img_h = img.height
+                if boxes.numel() > 0:
+                    flipped = boxes.clone()
+                    flipped[:, 1] = img_h - boxes[:, 3]
+                    flipped[:, 3] = img_h - boxes[:, 1]
+                    boxes = flipped
+
+            if random.random() < 0.3:
+                img = TF.rotate(img, 90, expand=True)
+                img_w, img_h = img.size
+                if boxes.numel() > 0:
+                    pre_w = img_h
+                    rotated = boxes.clone()
+                    rotated[:, 0] = boxes[:, 1]
+                    rotated[:, 1] = pre_w - boxes[:, 2]
+                    rotated[:, 2] = boxes[:, 3]
+                    rotated[:, 3] = pre_w - boxes[:, 0]
+                    boxes = rotated
+
+        # ------------------------------------------------------------------
+        # Convert PIL image → tensor after all augmentations are done
+        # ------------------------------------------------------------------
+        img_tensor = TF.to_tensor(img)   # [C, H, W] float in [0, 1]
+
+        if boxes.numel() > 0:
+            img_h_px, img_w_px = img_tensor.shape[1], img_tensor.shape[2]
+            boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, img_w_px)
+            boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, img_h_px)
+            valid = (boxes[:, 2] - boxes[:, 0] > 1) & (boxes[:, 3] - boxes[:, 1] > 1)
+            boxes  = boxes[valid]
+            labels = labels[valid]
+            anns   = [a for a, v in zip(anns, valid.tolist()) if v]
+
         target = {
-            "boxes": boxes,
-            "labels": labels,
+            "boxes":    boxes,
+            "labels":   labels,
             "image_id": torch.tensor([img_id]),
-            "area": torch.tensor([a["area"] * scale * scale for a in anns],
-                                 dtype=torch.float32)
-                    if anns else torch.zeros(0),
-            "iscrowd": torch.zeros(len(anns), dtype=torch.int64),
+            "area":     torch.tensor([a["area"] * scale * scale for a in anns],
+                                    dtype=torch.float32)
+                        if anns else torch.zeros(0),
+            "iscrowd":  torch.zeros(len(boxes), dtype=torch.int64),
         }
         return img_tensor, target
  
@@ -117,13 +159,15 @@ def collate_fn(batch):
 # ---------------------------------------------------------------------------
  
 def build_model(num_classes: int = 2) -> torch.nn.Module:
-    """
-    Load pretrained Faster R-CNN (ResNet-50 + FPN) and replace the
-    box predictor head with one for num_classes (background + cell).
-    """
     weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
     model = fasterrcnn_resnet50_fpn(weights=weights)
- 
+    model.rpn.post_nms_top_n_train = 2000
+    model.rpn.post_nms_top_n_test = 2000
+    model.roi_heads.detections_per_img = 750
+
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     return model
@@ -169,7 +213,7 @@ def run(data_dir: str,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
  
-    dataset = ScorecardCellDataset(data_dir)
+    dataset = ScorecardCellDataset(data_dir, augment=True)
     print(f"Dataset: {len(dataset)} images loaded from {data_dir}")
  
     loader = DataLoader(
@@ -180,10 +224,9 @@ def run(data_dir: str,
         collate_fn=collate_fn,
     )
  
-    model = build_model(num_classes=2)  # 0=background, 1=cell
+    model = build_model(num_classes=2)
     model.to(device)
  
-    # Only fine-tune the head + last backbone block
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
@@ -192,6 +235,12 @@ def run(data_dir: str,
  
     best_loss = float("inf")
     for epoch in range(1, epochs + 1):
+        if epoch == max(1, epochs // 4):
+            for param in model.backbone.parameters():
+                param.requires_grad = True
+            print("  -> Backbone unfrozen")
+
+
         avg_loss = train_one_epoch(model, optimizer, loader, device, epoch)
         lr_scheduler.step()
         print(f"Epoch {epoch}/{epochs}  avg_loss={avg_loss:.4f}")

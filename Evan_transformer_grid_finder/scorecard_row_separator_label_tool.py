@@ -18,6 +18,7 @@ JSON format (rowsep_v2):
     {
       "table_bbox": [x0, y0, x1, y1],
       "v_lines": [[[x,y],[x,y],[x,y]], ...],
+      "v_line_kinds": ["line" | "boundary", ...],  // optional, same length as v_lines
       "separators": [
         {"polyline": [[x,y],[x,y],[x,y]], "kind": "line"},
         {"polyline": [[x,y],[x,y],[x,y]], "kind": "boundary"}
@@ -112,6 +113,42 @@ def _line_distance_sq(line: list[list[int]], x: int, y: int) -> float:
     return min(d1, d2)
 
 
+def _normalize_sep_kind(kind: Any) -> str:
+    k = str(kind).strip().lower()
+    return k if k in ("line", "boundary") else "line"
+
+
+def _draw_text_outline(
+    img: np.ndarray,
+    text: str,
+    org: tuple[int, int],
+    font_scale: float,
+    fg: tuple[int, int, int] = (255, 255, 255),
+    bg: tuple[int, int, int] = (0, 0, 0),
+    thickness: int = 2,
+) -> None:
+    cv2.putText(
+        img,
+        text,
+        org,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        bg,
+        max(1, thickness + 2),
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        text,
+        org,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        fg,
+        max(1, thickness),
+        cv2.LINE_AA,
+    )
+
+
 def _load_flex_record(js: Path) -> dict[str, Any]:
     data = json.loads(js.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -137,6 +174,7 @@ def _load_rowsep_record(js: Path) -> dict[str, Any]:
             {
                 "table_bbox": data["table_bbox"],
                 "v_lines": data["v_lines"],
+                "v_line_kinds": data.get("v_line_kinds", []),
                 "separators": data["separators"],
             }
         ]
@@ -149,11 +187,13 @@ def _load_rowsep_record(js: Path) -> dict[str, Any]:
             continue
         bbox = t.get("table_bbox", [0, 0, 1, 1])
         v_lines = t.get("v_lines", [])
+        v_line_kinds = t.get("v_line_kinds", [])
         seps = t.get("separators", [])
         out_tables.append(
             {
                 "table_bbox": [int(v) for v in bbox[:4]],
                 "v_lines": v_lines if isinstance(v_lines, list) else [],
+                "v_line_kinds": v_line_kinds if isinstance(v_line_kinds, list) else [],
                 "separators": seps if isinstance(seps, list) else [],
             }
         )
@@ -211,12 +251,20 @@ def bootstrap_from_flex(
         bbox = _clip_bbox([int(v) for v in rec.get("table_bbox", [0, 0, w - 1, h - 1])], w, h)
 
         v_lines: list[list[list[int]]] = []
+        v_kinds: list[str] = []
+        src_kinds = rec.get("v_line_kinds", [])
+        if not isinstance(src_kinds, list):
+            src_kinds = []
         for ln in rec.get("v_lines", []):
             try:
                 v_lines.append(_normalize_v_polyline([[int(p[0]), int(p[1])] for p in ln], bbox))
+                v_kinds.append(_normalize_sep_kind(src_kinds[len(v_lines) - 1] if len(src_kinds) >= len(v_lines) else "line"))
             except Exception:
                 continue
-        v_lines.sort(key=lambda ln: float(np.mean([p[0] for p in ln])))
+        zipped = list(zip(v_lines, v_kinds))
+        zipped.sort(key=lambda it: float(np.mean([p[0] for p in it[0]])))
+        v_lines = [it[0] for it in zipped]
+        v_kinds = [it[1] for it in zipped]
 
         separators: list[dict[str, Any]] = []
         for ln in rec.get("h_lines", []):
@@ -235,6 +283,7 @@ def bootstrap_from_flex(
                 {
                     "table_bbox": [int(v) for v in bbox],
                     "v_lines": v_lines,
+                    "v_line_kinds": v_kinds,
                     "separators": separators,
                 }
             ],
@@ -257,6 +306,7 @@ class _EditorState:
     add_mode: bool = False
     delete_mode: bool = False
     toggle_kind_mode: bool = False
+    whole_toggle_mode: bool = False
     split_mode: bool = False
     move_table_mode: bool = False
     last_mouse: tuple[int, int] = (0, 0)
@@ -288,6 +338,20 @@ class RowSepLabelEditor:
     def _active_table(self) -> dict[str, Any]:
         return self.rec["tables"][self.state.table_idx]
 
+    def _sync_v_line_kinds(self, table: dict[str, Any]) -> None:
+        v_lines = table.get("v_lines", [])
+        if not isinstance(v_lines, list):
+            v_lines = []
+            table["v_lines"] = v_lines
+        kinds = table.get("v_line_kinds", [])
+        if not isinstance(kinds, list):
+            kinds = []
+        out: list[str] = []
+        for i in range(len(v_lines)):
+            k = kinds[i] if i < len(kinds) else "line"
+            out.append(_normalize_sep_kind(k))
+        table["v_line_kinds"] = out
+
     def _sanitize(self) -> None:
         if self.rec is None or self.image is None:
             return
@@ -296,7 +360,7 @@ class RowSepLabelEditor:
         if not isinstance(tabs, list):
             tabs = []
         if not tabs:
-            tabs = [{"table_bbox": [0, 0, w - 1, h - 1], "v_lines": [], "separators": []}]
+            tabs = [{"table_bbox": [0, 0, w - 1, h - 1], "v_lines": [], "v_line_kinds": [], "separators": []}]
 
         out_tabs: list[dict[str, Any]] = []
         for t in tabs:
@@ -305,31 +369,37 @@ class RowSepLabelEditor:
             bbox = _clip_bbox([int(v) for v in t.get("table_bbox", [0, 0, w - 1, h - 1])], w, h)
 
             v_new: list[list[list[int]]] = []
+            vk_new: list[str] = []
+            src_kinds = t.get("v_line_kinds", [])
+            if not isinstance(src_kinds, list):
+                src_kinds = []
             for ln in t.get("v_lines", []):
                 try:
                     nln = _normalize_v_polyline([[int(p[0]), int(p[1])] for p in ln], bbox)
                     v_new.append(nln)
+                    vk_new.append(_normalize_sep_kind(src_kinds[len(v_new) - 1] if len(src_kinds) >= len(v_new) else "line"))
                 except Exception:
                     continue
-            v_new.sort(key=lambda ln: float(np.mean([p[0] for p in ln])))
+            vz = list(zip(v_new, vk_new))
+            vz.sort(key=lambda it: float(np.mean([p[0] for p in it[0]])))
+            v_new = [it[0] for it in vz]
+            vk_new = [it[1] for it in vz]
 
             s_new: list[dict[str, Any]] = []
             for item in t.get("separators", []):
                 try:
                     poly = item.get("polyline", [])
-                    kind = str(item.get("kind", "line")).strip().lower()
-                    if kind not in ("line", "boundary"):
-                        kind = "line"
+                    kind = _normalize_sep_kind(item.get("kind", "line"))
                     nln = _normalize_h_polyline([[int(p[0]), int(p[1])] for p in poly], bbox)
                     s_new.append({"polyline": nln, "kind": kind})
                 except Exception:
                     continue
             s_new.sort(key=lambda item: float(np.mean([p[1] for p in item["polyline"]])))
 
-            out_tabs.append({"table_bbox": bbox, "v_lines": v_new, "separators": s_new})
+            out_tabs.append({"table_bbox": bbox, "v_lines": v_new, "v_line_kinds": vk_new, "separators": s_new})
 
         if not out_tabs:
-            out_tabs = [{"table_bbox": [0, 0, w - 1, h - 1], "v_lines": [], "separators": []}]
+            out_tabs = [{"table_bbox": [0, 0, w - 1, h - 1], "v_lines": [], "v_line_kinds": [], "separators": []}]
 
         self.rec["tables"] = out_tabs
         self.state.table_idx = int(np.clip(self.state.table_idx, 0, len(out_tabs) - 1))
@@ -349,6 +419,7 @@ class RowSepLabelEditor:
         self.state.add_mode = False
         self.state.delete_mode = False
         self.state.toggle_kind_mode = False
+        self.state.whole_toggle_mode = False
         self.state.split_mode = False
         self.state.move_table_mode = False
 
@@ -432,6 +503,28 @@ class RowSepLabelEditor:
             y = _lerp_y(p1, p2, x)
         return int(round(y))
 
+    def _polyline_x_at_y(self, line: list[list[int]], yq: int) -> int:
+        pts = sorted([[int(p[0]), int(p[1])] for p in line], key=lambda p: p[1])
+        if len(pts) != 3:
+            return int(pts[0][0]) if pts else 0
+        y = float(yq)
+        p0, p1, p2 = pts
+
+        def _lerp_x(a: list[int], b: list[int], yy: float) -> float:
+            ax, ay = float(a[0]), float(a[1])
+            bx, by = float(b[0]), float(b[1])
+            dy = by - ay
+            if abs(dy) < 1e-6:
+                return 0.5 * (ax + bx)
+            t = max(0.0, min(1.0, (yy - ay) / dy))
+            return ax + t * (bx - ax)
+
+        if y <= float(p1[1]):
+            x = _lerp_x(p0, p1, y)
+        else:
+            x = _lerp_x(p1, p2, y)
+        return int(round(x))
+
     def _vertical_x_guides(self, table: dict[str, Any]) -> list[int]:
         bbox = [int(v) for v in table["table_bbox"]]
         x0, _, x1, _ = bbox
@@ -443,6 +536,19 @@ class RowSepLabelEditor:
                 continue
         xs = sorted(set(int(np.clip(v, x0, x1)) for v in xs))
         return xs
+
+    def _horizontal_y_guides(self, table: dict[str, Any]) -> list[int]:
+        bbox = [int(v) for v in table["table_bbox"]]
+        _, y0, _, y1 = bbox
+        ys = [y0, y1]
+        for item in table.get("separators", []):
+            try:
+                poly = _normalize_h_polyline([[int(p[0]), int(p[1])] for p in item.get("polyline", [])], bbox)
+                ys.append(int(round(float(np.mean([p[1] for p in poly])))))
+            except Exception:
+                continue
+        ys = sorted(set(int(np.clip(v, y0, y1)) for v in ys))
+        return ys
 
     def _split_separator_at_click(self, table: dict[str, Any], li: int, x_click: int) -> bool:
         seps = table.get("separators", [])
@@ -503,6 +609,498 @@ class RowSepLabelEditor:
             seps.insert(li + off, item)
         return True
 
+    def _toggle_separator_kind_at_click(self, table: dict[str, Any], li: int, x_click: int) -> bool:
+        """Toggle kind only for the clicked span between nearest vertical guides.
+
+        If the separator already exists as short segments, this operates on the
+        selected segment directly. If it spans the whole table, it is split into
+        left/middle/right parts and only the clicked middle part is toggled.
+        """
+        seps = table.get("separators", [])
+        if not (0 <= li < len(seps)):
+            return False
+
+        bbox = [int(v) for v in table["table_bbox"]]
+        x0, _, x1, _ = bbox
+        if x1 - x0 < 8:
+            return False
+
+        src = seps[li]
+        src_poly = _normalize_h_polyline([[int(p[0]), int(p[1])] for p in src["polyline"]], bbox)
+        kind = str(src.get("kind", "line")).strip().lower()
+        if kind not in ("line", "boundary"):
+            kind = "line"
+        toggled_kind = "boundary" if kind == "line" else "line"
+
+        # Segment extents from current separator polyline.
+        pxs = sorted(int(p[0]) for p in src_poly)
+        sx0 = int(np.clip(pxs[0], x0, x1))
+        sx1 = int(np.clip(pxs[-1], x0, x1))
+        if sx1 - sx0 < 4:
+            seps[li]["kind"] = toggled_kind
+            return True
+
+        guides = self._vertical_x_guides(table)
+        guides = [int(gx) for gx in guides if sx0 <= int(gx) <= sx1]
+        if len(guides) < 2:
+            seps[li]["kind"] = toggled_kind
+            return True
+
+        # Pick the guide interval containing x_click (or nearest interval).
+        xv = int(np.clip(x_click, sx0, sx1))
+        left_x = None
+        right_x = None
+        for i in range(len(guides) - 1):
+            a, b = int(guides[i]), int(guides[i + 1])
+            if a <= xv <= b:
+                left_x, right_x = a, b
+                break
+        if left_x is None or right_x is None:
+            # Nearest interval by center if click is slightly out.
+            best = None
+            best_d = 1e18
+            for i in range(len(guides) - 1):
+                a, b = int(guides[i]), int(guides[i + 1])
+                c = 0.5 * (a + b)
+                d = abs(float(xv) - c)
+                if d < best_d:
+                    best_d = d
+                    best = (a, b)
+            if best is None:
+                seps[li]["kind"] = toggled_kind
+                return True
+            left_x, right_x = int(best[0]), int(best[1])
+
+        min_len = 6
+        new_items: list[dict[str, Any]] = []
+
+        # Left unchanged piece.
+        if left_x - sx0 >= min_len:
+            lx0 = int(sx0)
+            lx1 = int(left_x)
+            lxm = int(round(0.5 * (lx0 + lx1)))
+            left_poly = [
+                [lx0, self._polyline_y_at_x(src_poly, lx0)],
+                [lxm, self._polyline_y_at_x(src_poly, lxm)],
+                [lx1, self._polyline_y_at_x(src_poly, lx1)],
+            ]
+            new_items.append({"polyline": _normalize_h_polyline(left_poly, bbox), "kind": kind})
+
+        # Middle toggled piece.
+        mx0 = int(left_x)
+        mx1 = int(right_x)
+        if mx1 - mx0 >= 2:
+            mxm = int(round(0.5 * (mx0 + mx1)))
+            mid_poly = [
+                [mx0, self._polyline_y_at_x(src_poly, mx0)],
+                [mxm, self._polyline_y_at_x(src_poly, mxm)],
+                [mx1, self._polyline_y_at_x(src_poly, mx1)],
+            ]
+            new_items.append({"polyline": _normalize_h_polyline(mid_poly, bbox), "kind": toggled_kind})
+
+        # Right unchanged piece.
+        if sx1 - right_x >= min_len:
+            rx0 = int(right_x)
+            rx1 = int(sx1)
+            rxm = int(round(0.5 * (rx0 + rx1)))
+            right_poly = [
+                [rx0, self._polyline_y_at_x(src_poly, rx0)],
+                [rxm, self._polyline_y_at_x(src_poly, rxm)],
+                [rx1, self._polyline_y_at_x(src_poly, rx1)],
+            ]
+            new_items.append({"polyline": _normalize_h_polyline(right_poly, bbox), "kind": kind})
+
+        if not new_items:
+            seps[li]["kind"] = toggled_kind
+            return True
+
+        seps.pop(li)
+        for off, item in enumerate(new_items):
+            seps.insert(li + off, item)
+        return True
+
+    def _toggle_separator_kind_whole_row_at_click(self, table: dict[str, Any], li: int) -> bool:
+        """Toggle separator kind for the whole clicked horizontal row."""
+        seps = table.get("separators", [])
+        if not (0 <= li < len(seps)):
+            return False
+
+        bbox = [int(v) for v in table["table_bbox"]]
+        centers: list[tuple[int, float]] = []
+        for i, item in enumerate(seps):
+            try:
+                poly = _normalize_h_polyline([[int(p[0]), int(p[1])] for p in item.get("polyline", [])], bbox)
+                cy = float(np.mean([p[1] for p in poly]))
+                centers.append((i, cy))
+            except Exception:
+                continue
+        if not centers:
+            return False
+
+        src_kind = str(seps[li].get("kind", "line")).strip().lower()
+        if src_kind not in ("line", "boundary"):
+            src_kind = "line"
+        toggled_kind = "boundary" if src_kind == "line" else "line"
+
+        y_ref = None
+        for i, cy in centers:
+            if i == li:
+                y_ref = cy
+                break
+        if y_ref is None:
+            seps[li]["kind"] = toggled_kind
+            return True
+
+        ys = sorted([cy for _, cy in centers])
+        if len(ys) >= 2:
+            min_gap = min(max(1.0, ys[i + 1] - ys[i]) for i in range(len(ys) - 1))
+            row_tol = int(np.clip(round(0.35 * min_gap), 3, 14))
+        else:
+            row_tol = 6
+
+        row_idxs = [i for i, cy in centers if abs(cy - y_ref) <= float(row_tol)]
+        if not row_idxs:
+            row_idxs = [li]
+
+        for i in row_idxs:
+            seps[i]["kind"] = toggled_kind
+        return True
+
+    def _delete_separator_segment_at_click(self, table: dict[str, Any], li: int, x_click: int) -> bool:
+        """Delete only the clicked separator span between nearest vertical guides.
+
+        If the selected separator already represents a short segment, remove it.
+        If it spans wider than one guide interval, split and remove only the
+        clicked interval while keeping left/right pieces.
+        """
+        seps = table.get("separators", [])
+        if not (0 <= li < len(seps)):
+            return False
+
+        bbox = [int(v) for v in table["table_bbox"]]
+        x0, _, x1, _ = bbox
+        if x1 - x0 < 8:
+            seps.pop(li)
+            return True
+
+        src = seps[li]
+        src_poly = _normalize_h_polyline([[int(p[0]), int(p[1])] for p in src["polyline"]], bbox)
+        kind = str(src.get("kind", "line")).strip().lower()
+        if kind not in ("line", "boundary"):
+            kind = "line"
+
+        pxs = sorted(int(p[0]) for p in src_poly)
+        sx0 = int(np.clip(pxs[0], x0, x1))
+        sx1 = int(np.clip(pxs[-1], x0, x1))
+        if sx1 - sx0 < 10:
+            seps.pop(li)
+            return True
+
+        guides = self._vertical_x_guides(table)
+        guides = [int(gx) for gx in guides if sx0 <= int(gx) <= sx1]
+        if len(guides) < 2:
+            seps.pop(li)
+            return True
+
+        xv = int(np.clip(x_click, sx0, sx1))
+        left_x = None
+        right_x = None
+        for i in range(len(guides) - 1):
+            a, b = int(guides[i]), int(guides[i + 1])
+            if a <= xv <= b:
+                left_x, right_x = a, b
+                break
+        if left_x is None or right_x is None:
+            best = None
+            best_d = 1e18
+            for i in range(len(guides) - 1):
+                a, b = int(guides[i]), int(guides[i + 1])
+                c = 0.5 * (a + b)
+                d = abs(float(xv) - c)
+                if d < best_d:
+                    best_d = d
+                    best = (a, b)
+            if best is None:
+                seps.pop(li)
+                return True
+            left_x, right_x = int(best[0]), int(best[1])
+
+        min_len = 6
+        new_items: list[dict[str, Any]] = []
+
+        # Keep left piece.
+        if left_x - sx0 >= min_len:
+            lx0 = int(sx0)
+            lx1 = int(left_x)
+            lxm = int(round(0.5 * (lx0 + lx1)))
+            left_poly = [
+                [lx0, self._polyline_y_at_x(src_poly, lx0)],
+                [lxm, self._polyline_y_at_x(src_poly, lxm)],
+                [lx1, self._polyline_y_at_x(src_poly, lx1)],
+            ]
+            new_items.append({"polyline": _normalize_h_polyline(left_poly, bbox), "kind": kind})
+
+        # Keep right piece.
+        if sx1 - right_x >= min_len:
+            rx0 = int(right_x)
+            rx1 = int(sx1)
+            rxm = int(round(0.5 * (rx0 + rx1)))
+            right_poly = [
+                [rx0, self._polyline_y_at_x(src_poly, rx0)],
+                [rxm, self._polyline_y_at_x(src_poly, rxm)],
+                [rx1, self._polyline_y_at_x(src_poly, rx1)],
+            ]
+            new_items.append({"polyline": _normalize_h_polyline(right_poly, bbox), "kind": kind})
+
+        # Replace original with kept pieces (middle clicked segment deleted).
+        seps.pop(li)
+        for off, item in enumerate(new_items):
+            seps.insert(li + off, item)
+        return True
+
+    def _delete_vertical_segment_at_click(self, table: dict[str, Any], li: int, y_click: int) -> bool:
+        """Delete only the clicked vertical span between nearest horizontal guides."""
+        v_lines = table.get("v_lines", [])
+        self._sync_v_line_kinds(table)
+        v_kinds = table.get("v_line_kinds", [])
+        if not (0 <= li < len(v_lines)):
+            return False
+
+        bbox = [int(v) for v in table["table_bbox"]]
+        _, y0, _, y1 = bbox
+        if y1 - y0 < 8:
+            v_lines.pop(li)
+            if 0 <= li < len(v_kinds):
+                v_kinds.pop(li)
+            return True
+
+        src_poly = _normalize_v_polyline([[int(p[0]), int(p[1])] for p in v_lines[li]], bbox)
+        src_kind = _normalize_sep_kind(v_kinds[li] if 0 <= li < len(v_kinds) else "line")
+        pys = sorted(int(p[1]) for p in src_poly)
+        sy0 = int(np.clip(pys[0], y0, y1))
+        sy1 = int(np.clip(pys[-1], y0, y1))
+        if sy1 - sy0 < 10:
+            v_lines.pop(li)
+            if 0 <= li < len(v_kinds):
+                v_kinds.pop(li)
+            return True
+
+        guides = self._horizontal_y_guides(table)
+        guides = [int(gy) for gy in guides if sy0 <= int(gy) <= sy1]
+        if len(guides) < 2:
+            v_lines.pop(li)
+            if 0 <= li < len(v_kinds):
+                v_kinds.pop(li)
+            return True
+
+        yv = int(np.clip(y_click, sy0, sy1))
+        top_y = None
+        bot_y = None
+        for i in range(len(guides) - 1):
+            a, b = int(guides[i]), int(guides[i + 1])
+            if a <= yv <= b:
+                top_y, bot_y = a, b
+                break
+        if top_y is None or bot_y is None:
+            best = None
+            best_d = 1e18
+            for i in range(len(guides) - 1):
+                a, b = int(guides[i]), int(guides[i + 1])
+                c = 0.5 * (a + b)
+                d = abs(float(yv) - c)
+                if d < best_d:
+                    best_d = d
+                    best = (a, b)
+            if best is None:
+                v_lines.pop(li)
+                if 0 <= li < len(v_kinds):
+                    v_kinds.pop(li)
+                return True
+            top_y, bot_y = int(best[0]), int(best[1])
+
+        min_len = 6
+        new_lines: list[list[list[int]]] = []
+
+        # Keep top piece.
+        if top_y - sy0 >= min_len:
+            ty0 = int(sy0)
+            ty1 = int(top_y)
+            tym = int(round(0.5 * (ty0 + ty1)))
+            top_poly = [
+                [self._polyline_x_at_y(src_poly, ty0), ty0],
+                [self._polyline_x_at_y(src_poly, tym), tym],
+                [self._polyline_x_at_y(src_poly, ty1), ty1],
+            ]
+            new_lines.append(_normalize_v_polyline(top_poly, bbox))
+
+        # Keep bottom piece.
+        if sy1 - bot_y >= min_len:
+            by0 = int(bot_y)
+            by1 = int(sy1)
+            bym = int(round(0.5 * (by0 + by1)))
+            bot_poly = [
+                [self._polyline_x_at_y(src_poly, by0), by0],
+                [self._polyline_x_at_y(src_poly, bym), bym],
+                [self._polyline_x_at_y(src_poly, by1), by1],
+            ]
+            new_lines.append(_normalize_v_polyline(bot_poly, bbox))
+
+        v_lines.pop(li)
+        if 0 <= li < len(v_kinds):
+            v_kinds.pop(li)
+        for off, ln in enumerate(new_lines):
+            v_lines.insert(li + off, ln)
+            v_kinds.insert(li + off, src_kind)
+        return True
+
+    def _toggle_vertical_kind_at_click(self, table: dict[str, Any], li: int, y_click: int) -> bool:
+        """Toggle kind only for clicked vertical span between nearest horizontal guides."""
+        v_lines = table.get("v_lines", [])
+        self._sync_v_line_kinds(table)
+        v_kinds = table.get("v_line_kinds", [])
+        if not (0 <= li < len(v_lines)):
+            return False
+
+        bbox = [int(v) for v in table["table_bbox"]]
+        _, y0, _, y1 = bbox
+        if y1 - y0 < 8:
+            return False
+
+        src_poly = _normalize_v_polyline([[int(p[0]), int(p[1])] for p in v_lines[li]], bbox)
+        src_kind = _normalize_sep_kind(v_kinds[li] if 0 <= li < len(v_kinds) else "line")
+        toggled_kind = "boundary" if src_kind == "line" else "line"
+
+        pys = sorted(int(p[1]) for p in src_poly)
+        sy0 = int(np.clip(pys[0], y0, y1))
+        sy1 = int(np.clip(pys[-1], y0, y1))
+        if sy1 - sy0 < 4:
+            v_kinds[li] = toggled_kind
+            return True
+
+        guides = self._horizontal_y_guides(table)
+        guides = [int(gy) for gy in guides if sy0 <= int(gy) <= sy1]
+        if len(guides) < 2:
+            v_kinds[li] = toggled_kind
+            return True
+
+        yv = int(np.clip(y_click, sy0, sy1))
+        top_y = None
+        bot_y = None
+        for i in range(len(guides) - 1):
+            a, b = int(guides[i]), int(guides[i + 1])
+            if a <= yv <= b:
+                top_y, bot_y = a, b
+                break
+        if top_y is None or bot_y is None:
+            best = None
+            best_d = 1e18
+            for i in range(len(guides) - 1):
+                a, b = int(guides[i]), int(guides[i + 1])
+                c = 0.5 * (a + b)
+                d = abs(float(yv) - c)
+                if d < best_d:
+                    best_d = d
+                    best = (a, b)
+            if best is None:
+                v_kinds[li] = toggled_kind
+                return True
+            top_y, bot_y = int(best[0]), int(best[1])
+
+        min_len = 6
+        new_lines: list[list[list[int]]] = []
+        new_kinds: list[str] = []
+
+        if top_y - sy0 >= min_len:
+            ty0 = int(sy0)
+            ty1 = int(top_y)
+            tym = int(round(0.5 * (ty0 + ty1)))
+            top_poly = [
+                [self._polyline_x_at_y(src_poly, ty0), ty0],
+                [self._polyline_x_at_y(src_poly, tym), tym],
+                [self._polyline_x_at_y(src_poly, ty1), ty1],
+            ]
+            new_lines.append(_normalize_v_polyline(top_poly, bbox))
+            new_kinds.append(src_kind)
+
+        my0 = int(top_y)
+        my1 = int(bot_y)
+        if my1 - my0 >= 2:
+            mym = int(round(0.5 * (my0 + my1)))
+            mid_poly = [
+                [self._polyline_x_at_y(src_poly, my0), my0],
+                [self._polyline_x_at_y(src_poly, mym), mym],
+                [self._polyline_x_at_y(src_poly, my1), my1],
+            ]
+            new_lines.append(_normalize_v_polyline(mid_poly, bbox))
+            new_kinds.append(toggled_kind)
+
+        if sy1 - bot_y >= min_len:
+            by0 = int(bot_y)
+            by1 = int(sy1)
+            bym = int(round(0.5 * (by0 + by1)))
+            bot_poly = [
+                [self._polyline_x_at_y(src_poly, by0), by0],
+                [self._polyline_x_at_y(src_poly, bym), bym],
+                [self._polyline_x_at_y(src_poly, by1), by1],
+            ]
+            new_lines.append(_normalize_v_polyline(bot_poly, bbox))
+            new_kinds.append(src_kind)
+
+        if not new_lines:
+            v_kinds[li] = toggled_kind
+            return True
+
+        v_lines.pop(li)
+        v_kinds.pop(li)
+        for off, ln in enumerate(new_lines):
+            v_lines.insert(li + off, ln)
+            v_kinds.insert(li + off, new_kinds[off])
+        return True
+
+    def _toggle_vertical_kind_whole_col_at_click(self, table: dict[str, Any], li: int) -> bool:
+        """Toggle kind for all vertical segments in the clicked column."""
+        v_lines = table.get("v_lines", [])
+        self._sync_v_line_kinds(table)
+        v_kinds = table.get("v_line_kinds", [])
+        if not (0 <= li < len(v_lines)):
+            return False
+
+        centers: list[tuple[int, float]] = []
+        for i, ln in enumerate(v_lines):
+            try:
+                cx = float(np.mean([int(p[0]) for p in ln]))
+                centers.append((i, cx))
+            except Exception:
+                continue
+        if not centers:
+            return False
+
+        src_kind = _normalize_sep_kind(v_kinds[li] if 0 <= li < len(v_kinds) else "line")
+        toggled_kind = "boundary" if src_kind == "line" else "line"
+
+        x_ref = None
+        for i, cx in centers:
+            if i == li:
+                x_ref = cx
+                break
+        if x_ref is None:
+            v_kinds[li] = toggled_kind
+            return True
+
+        xs = sorted([cx for _, cx in centers])
+        if len(xs) >= 2:
+            min_gap = min(max(1.0, xs[i + 1] - xs[i]) for i in range(len(xs) - 1))
+            col_tol = int(np.clip(round(0.35 * min_gap), 3, 14))
+        else:
+            col_tol = 6
+
+        col_idxs = [i for i, cx in centers if abs(cx - x_ref) <= float(col_tol)]
+        if not col_idxs:
+            col_idxs = [li]
+        for i in col_idxs:
+            v_kinds[i] = toggled_kind
+        return True
+
     def _render(self) -> np.ndarray:
         vis = self.image.copy()
         for ti, t in enumerate(self.rec.get("tables", [])):
@@ -521,11 +1119,22 @@ class RowSepLabelEditor:
                     cv2.circle(vis, (cx, cy), 8, (0, 255, 255), -1)
                     cv2.circle(vis, (cx, cy), 11, (0, 180, 255), 1)
 
-            for ln in t.get("v_lines", []):
+            self._sync_v_line_kinds(t)
+            vk = t.get("v_line_kinds", [])
+            for i, ln in enumerate(t.get("v_lines", [])):
+                kind = _normalize_sep_kind(vk[i] if i < len(vk) else "line")
+                if kind == "boundary":
+                    col = (255, 225, 80) if active else (190, 170, 110)
+                    pcol = (255, 240, 130) if active else (210, 190, 130)
+                else:
+                    col = (255, 170, 60) if active else (210, 120, 120)
+                    pcol = (255, 200, 120) if active else (220, 150, 150)
                 pts = np.array(ln, dtype=np.int32).reshape(-1, 1, 2)
-                col = (255, 170, 60) if active else (210, 120, 120)
                 w = 2 if (active and self.state.mode == "v") else 1
                 cv2.polylines(vis, [pts], False, col, w, cv2.LINE_AA)
+                if active and self.state.mode == "v":
+                    for p in ln:
+                        cv2.circle(vis, (int(p[0]), int(p[1])), 3, pcol, -1)
 
             for item in t.get("separators", []):
                 ln = item["polyline"]
@@ -546,28 +1155,39 @@ class RowSepLabelEditor:
         add_tag = " add=ON" if self.state.add_mode else ""
         del_tag = " del=ON" if self.state.delete_mode else ""
         tog_tag = " toggle=ON" if self.state.toggle_kind_mode else ""
+        row_tog_tag = " row-toggle=ON" if (self.state.toggle_kind_mode and self.state.whole_toggle_mode) else ""
         spl_tag = " split=ON" if self.state.split_mode else ""
         mov_tag = " move=ON" if self.state.move_table_mode else ""
         stem = self.current_json.stem if self.current_json else ""
         t_act = self._active_table()
+        self._sync_v_line_kinds(t_act)
+        vk_act = t_act.get("v_line_kinds", [])
+        v_line_n = sum(1 for k in vk_act if _normalize_sep_kind(k) == "line")
+        v_bound_n = sum(1 for k in vk_act if _normalize_sep_kind(k) == "boundary")
         t1 = f"{self.state.idx+1}/{len(self.state.records)} {stem}"
         t2 = (
             f"grid={self.state.table_idx+1}/{self._table_count()} "
-            f"mode={self.state.mode}{add_tag}{del_tag}{tog_tag}{spl_tag}{mov_tag} "
+            f"mode={self.state.mode}{add_tag}{del_tag}{tog_tag}{row_tog_tag}{spl_tag}{mov_tag} "
             f"v={len(t_act['v_lines'])} "
+            f"vline={v_line_n} "
+            f"vboundary={v_bound_n} "
             f"line={sum(1 for s in t_act['separators'] if s.get('kind')=='line')} "
             f"boundary={sum(1 for s in t_act['separators'] if s.get('kind')=='boundary')}"
         )
-        t3 = "keys: 1 table 2 separators 3 verticals | [ ] switch grid | g add-grid | r remove-grid | m move-grid(table) | drag points/lines/corners | a add | x delete | t toggle-kind(sep) | b split-at-cell(sep) | s save | n/p next/prev | q quit"
+        t3 = "keys: 1 table 2 separators 3 verticals | [ ] switch grid | g add-grid | r remove-grid | m move-grid(table) | drag points/lines/corners | a add | x delete | t toggle-kind(span) | T toggle-kind(full-line) | b split-at-cell(sep) | s save | n/p next/prev | q quit"
 
         pad = int(self.display_pad)
         h, w = vis.shape[:2]
         canvas = np.full((h + 2 * pad, w + 2 * pad, 3), (42, 42, 42), dtype=np.uint8)
         canvas[pad : pad + h, pad : pad + w] = vis
         cv2.rectangle(canvas, (pad - 1, pad - 1), (pad + w, pad + h), (130, 130, 130), 1)
-        cv2.putText(canvas, t1, (pad + 12, pad + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, t2, (pad + 12, pad + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, t3, (pad + 12, pad + h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (255, 255, 255), 1, cv2.LINE_AA)
+        # High-contrast HUD background for readability on any image.
+        hud = canvas.copy()
+        cv2.rectangle(hud, (pad + 4, pad + 4), (pad + min(w - 4, 1240), pad + 62), (0, 0, 0), -1)
+        cv2.addWeighted(hud, 0.45, canvas, 0.55, 0.0, canvas)
+        _draw_text_outline(canvas, t1, (pad + 12, pad + 24), 0.66, fg=(255, 255, 255), bg=(0, 0, 0), thickness=2)
+        _draw_text_outline(canvas, t2, (pad + 12, pad + 52), 0.58, fg=(255, 255, 255), bg=(0, 0, 0), thickness=1)
+        _draw_text_outline(canvas, t3, (pad + 12, pad + h - 12), 0.47, fg=(255, 255, 255), bg=(0, 0, 0), thickness=1)
         return canvas
 
     def _mouse_cb(self, event: int, x: int, y: int, flags: int, param: object) -> None:
@@ -609,16 +1229,21 @@ class RowSepLabelEditor:
                 if self.state.delete_mode:
                     li = self._nearest_line_idx(sep_lines, x, y)
                     if li >= 0:
-                        table["separators"].pop(li)
+                        _ = self._delete_separator_segment_at_click(table, li, x_click=x)
+                        self._sanitize()
                     self.state.delete_mode = False
                     return
 
                 if self.state.toggle_kind_mode:
                     li = self._nearest_line_idx(sep_lines, x, y)
                     if li >= 0:
-                        kind = str(table["separators"][li].get("kind", "line"))
-                        table["separators"][li]["kind"] = "boundary" if kind == "line" else "line"
+                        if self.state.whole_toggle_mode:
+                            _ = self._toggle_separator_kind_whole_row_at_click(table, li)
+                        else:
+                            _ = self._toggle_separator_kind_at_click(table, li, x_click=x)
+                        self._sanitize()
                     self.state.toggle_kind_mode = False
+                    self.state.whole_toggle_mode = False
                     return
 
                 if self.state.split_mode:
@@ -656,17 +1281,33 @@ class RowSepLabelEditor:
 
             if self.state.mode == "v":
                 v_lines = table["v_lines"]
+                self._sync_v_line_kinds(table)
+                v_kinds = table.get("v_line_kinds", [])
                 if self.state.delete_mode:
                     li = self._nearest_line_idx(v_lines, x, y)
                     if li >= 0:
-                        v_lines.pop(li)
+                        _ = self._delete_vertical_segment_at_click(table, li, y_click=y)
+                        self._sanitize()
                     self.state.delete_mode = False
+                    return
+
+                if self.state.toggle_kind_mode:
+                    li = self._nearest_line_idx(v_lines, x, y)
+                    if li >= 0:
+                        if self.state.whole_toggle_mode:
+                            _ = self._toggle_vertical_kind_whole_col_at_click(table, li)
+                        else:
+                            _ = self._toggle_vertical_kind_at_click(table, li, y_click=y)
+                        self._sanitize()
+                    self.state.toggle_kind_mode = False
+                    self.state.whole_toggle_mode = False
                     return
 
                 if self.state.add_mode:
                     nx = int(np.clip(x, x0, x1))
                     ym = int(round(0.5 * (y0 + y1)))
                     v_lines.append([[nx, y0], [nx, ym], [nx, y1]])
+                    v_kinds.append("boundary")
                     self.state.add_mode = False
                     self._sanitize()
                     return
@@ -802,6 +1443,7 @@ class RowSepLabelEditor:
                 self.state.add_mode = False
                 self.state.delete_mode = False
                 self.state.toggle_kind_mode = False
+                self.state.whole_toggle_mode = False
                 self.state.split_mode = False
                 continue
             if k == ord("2"):
@@ -809,6 +1451,7 @@ class RowSepLabelEditor:
                 self.state.add_mode = False
                 self.state.delete_mode = False
                 self.state.toggle_kind_mode = False
+                self.state.whole_toggle_mode = False
                 self.state.split_mode = False
                 self.state.move_table_mode = False
                 continue
@@ -817,6 +1460,7 @@ class RowSepLabelEditor:
                 self.state.add_mode = False
                 self.state.delete_mode = False
                 self.state.toggle_kind_mode = False
+                self.state.whole_toggle_mode = False
                 self.state.split_mode = False
                 self.state.move_table_mode = False
                 continue
@@ -825,6 +1469,7 @@ class RowSepLabelEditor:
                 self.state.add_mode = False
                 self.state.delete_mode = False
                 self.state.toggle_kind_mode = False
+                self.state.whole_toggle_mode = False
                 self.state.split_mode = False
                 continue
             if k == ord("]"):
@@ -832,6 +1477,7 @@ class RowSepLabelEditor:
                 self.state.add_mode = False
                 self.state.delete_mode = False
                 self.state.toggle_kind_mode = False
+                self.state.whole_toggle_mode = False
                 self.state.split_mode = False
                 continue
             if k == ord("g"):
@@ -872,6 +1518,7 @@ class RowSepLabelEditor:
                 if self.state.add_mode:
                     self.state.delete_mode = False
                     self.state.toggle_kind_mode = False
+                    self.state.whole_toggle_mode = False
                     self.state.split_mode = False
                     self.state.move_table_mode = False
                 continue
@@ -880,11 +1527,31 @@ class RowSepLabelEditor:
                 if self.state.delete_mode:
                     self.state.add_mode = False
                     self.state.toggle_kind_mode = False
+                    self.state.whole_toggle_mode = False
                     self.state.split_mode = False
                     self.state.move_table_mode = False
                 continue
-            if k == ord("t") and self.state.mode == "sep":
-                self.state.toggle_kind_mode = not self.state.toggle_kind_mode
+            if k == ord("t") and self.state.mode in ("sep", "v"):
+                # Lowercase t toggles span-level kind mode.
+                if self.state.toggle_kind_mode and not self.state.whole_toggle_mode:
+                    self.state.toggle_kind_mode = False
+                else:
+                    self.state.toggle_kind_mode = True
+                self.state.whole_toggle_mode = False
+                if self.state.toggle_kind_mode:
+                    self.state.add_mode = False
+                    self.state.delete_mode = False
+                    self.state.split_mode = False
+                    self.state.move_table_mode = False
+                continue
+            if k == ord("T") and self.state.mode in ("sep", "v"):
+                # Uppercase T toggles whole-line kind mode.
+                if self.state.toggle_kind_mode and self.state.whole_toggle_mode:
+                    self.state.toggle_kind_mode = False
+                    self.state.whole_toggle_mode = False
+                else:
+                    self.state.toggle_kind_mode = True
+                    self.state.whole_toggle_mode = True
                 if self.state.toggle_kind_mode:
                     self.state.add_mode = False
                     self.state.delete_mode = False
@@ -897,6 +1564,7 @@ class RowSepLabelEditor:
                     self.state.add_mode = False
                     self.state.delete_mode = False
                     self.state.toggle_kind_mode = False
+                    self.state.whole_toggle_mode = False
                     self.state.move_table_mode = False
                 continue
             if k == ord("m") and self.state.mode == "table":
@@ -905,6 +1573,7 @@ class RowSepLabelEditor:
                     self.state.add_mode = False
                     self.state.delete_mode = False
                     self.state.toggle_kind_mode = False
+                    self.state.whole_toggle_mode = False
                     self.state.split_mode = False
                 continue
             if k == ord("n"):
@@ -960,6 +1629,8 @@ def render_rowsep_masks(
 
         table = np.zeros((h, w), dtype=np.uint8)
         vmask = np.zeros((h, w), dtype=np.uint8)
+        vline = np.zeros((h, w), dtype=np.uint8)
+        vbound = np.zeros((h, w), dtype=np.uint8)
         hline = np.zeros((h, w), dtype=np.uint8)
         hbound = np.zeros((h, w), dtype=np.uint8)
 
@@ -970,25 +1641,35 @@ def render_rowsep_masks(
             x0, y0, x1, y1 = bbox
             cv2.rectangle(table, (x0, y0), (x1, y1), 255, -1)
 
-            for ln in t.get("v_lines", []):
+            v_kinds = t.get("v_line_kinds", [])
+            if not isinstance(v_kinds, list):
+                v_kinds = []
+            for i, ln in enumerate(t.get("v_lines", [])):
                 nln = _normalize_v_polyline([[int(p[0]), int(p[1])] for p in ln], bbox)
                 pts = np.array(nln, dtype=np.int32).reshape(-1, 1, 2)
-                cv2.polylines(vmask, [pts], False, 255, int(max(1, line_thickness)), cv2.LINE_AA)
+                kind = _normalize_sep_kind(v_kinds[i] if i < len(v_kinds) else "line")
+                if kind == "boundary":
+                    cv2.polylines(vbound, [pts], False, 255, int(max(1, line_thickness)), cv2.LINE_AA)
+                else:
+                    cv2.polylines(vline, [pts], False, 255, int(max(1, line_thickness)), cv2.LINE_AA)
 
             for item in t.get("separators", []):
                 nln = _normalize_h_polyline([[int(p[0]), int(p[1])] for p in item.get("polyline", [])], bbox)
                 pts = np.array(nln, dtype=np.int32).reshape(-1, 1, 2)
-                kind = str(item.get("kind", "line")).strip().lower()
+                kind = _normalize_sep_kind(item.get("kind", "line"))
                 if kind == "boundary":
                     cv2.polylines(hbound, [pts], False, 255, int(max(1, line_thickness)), cv2.LINE_AA)
                 else:
                     cv2.polylines(hline, [pts], False, 255, int(max(1, line_thickness)), cv2.LINE_AA)
 
+        vmask = cv2.bitwise_or(vline, vbound)
         hunion = cv2.bitwise_or(hline, hbound)
 
         p_img = img_dir / f"{stem}.png"
         p_t = msk_dir / f"{stem}_table.png"
         p_v = msk_dir / f"{stem}_v.png"
+        p_vline = msk_dir / f"{stem}_v_line.png"
+        p_vbound = msk_dir / f"{stem}_v_boundary.png"
         p_h = msk_dir / f"{stem}_h.png"
         p_hline = msk_dir / f"{stem}_h_line.png"
         p_hbound = msk_dir / f"{stem}_h_boundary.png"
@@ -996,6 +1677,8 @@ def render_rowsep_masks(
         cv2.imwrite(str(p_img), img)
         cv2.imwrite(str(p_t), table)
         cv2.imwrite(str(p_v), vmask)
+        cv2.imwrite(str(p_vline), vline)
+        cv2.imwrite(str(p_vbound), vbound)
         cv2.imwrite(str(p_h), hunion)
         cv2.imwrite(str(p_hline), hline)
         cv2.imwrite(str(p_hbound), hbound)
@@ -1006,6 +1689,8 @@ def render_rowsep_masks(
             "image": str(p_img.relative_to(out_labels_dir)),
             "table_mask": str(p_t.relative_to(out_labels_dir)),
             "v_mask": str(p_v.relative_to(out_labels_dir)),
+            "v_line_mask": str(p_vline.relative_to(out_labels_dir)),
+            "v_boundary_mask": str(p_vbound.relative_to(out_labels_dir)),
             "h_mask": str(p_h.relative_to(out_labels_dir)),
             "h_line_mask": str(p_hline.relative_to(out_labels_dir)),
             "h_boundary_mask": str(p_hbound.relative_to(out_labels_dir)),
@@ -1049,19 +1734,27 @@ def write_rowsep_overlays(rowsep_labels_dir: Path, out_dir: Path) -> None:
             vis = cv2.addWeighted(vis, 0.89, tmp, 0.11, 0.0)
             cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 220, 0), 2)
 
-            for ln in t.get("v_lines", []):
+            v_kinds = t.get("v_line_kinds", [])
+            if not isinstance(v_kinds, list):
+                v_kinds = []
+            for i, ln in enumerate(t.get("v_lines", [])):
                 nln = _normalize_v_polyline([[int(p[0]), int(p[1])] for p in ln], bbox)
+                kind = _normalize_sep_kind(v_kinds[i] if i < len(v_kinds) else "line")
+                col_v = (255, 120, 120) if kind == "line" else (255, 220, 80)
                 pts = np.array(nln, dtype=np.int32).reshape(-1, 1, 2)
-                cv2.polylines(vis, [pts], False, (255, 120, 120), 1, cv2.LINE_AA)
+                cv2.polylines(vis, [pts], False, col_v, 1, cv2.LINE_AA)
 
             for item in t.get("separators", []):
                 nln = _normalize_h_polyline([[int(p[0]), int(p[1])] for p in item.get("polyline", [])], bbox)
-                kind = str(item.get("kind", "line")).strip().lower()
+                kind = _normalize_sep_kind(item.get("kind", "line"))
                 col = (80, 80, 255) if kind == "line" else (0, 190, 255)
                 pts = np.array(nln, dtype=np.int32).reshape(-1, 1, 2)
                 cv2.polylines(vis, [pts], False, col, 2, cv2.LINE_AA)
 
-        cv2.putText(vis, js.stem, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (0, 255, 255), 2, cv2.LINE_AA)
+        hud = vis.copy()
+        cv2.rectangle(hud, (8, 6), (min(w - 8, 560), 38), (0, 0, 0), -1)
+        cv2.addWeighted(hud, 0.45, vis, 0.55, 0.0, vis)
+        _draw_text_outline(vis, js.stem, (14, 28), 0.78, fg=(255, 255, 255), bg=(0, 0, 0), thickness=2)
         cv2.imwrite(str(out_dir / f"{js.stem}_overlay.png"), vis)
     print(f"[ok] wrote overlays to {out_dir}")
 

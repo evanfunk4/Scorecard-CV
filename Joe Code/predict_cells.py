@@ -20,11 +20,13 @@ Output layout:
  
 import argparse
 from pathlib import Path
+from xml.parsers.expat import model
  
 import cv2
 import numpy as np
 import torch
 from PIL import Image
+import torchvision
 from torchvision.models.detection import (
     FasterRCNN_ResNet50_FPN_Weights,
     fasterrcnn_resnet50_fpn,
@@ -41,6 +43,11 @@ def load_model(weights_path: str, device: torch.device) -> torch.nn.Module:
     model = fasterrcnn_resnet50_fpn(
         weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT
     )
+    model.rpn.post_nms_top_n_test = 2000
+    model.roi_heads.score_thresh = 0.3
+    model.roi_heads.nms_thresh = 0.3 
+    model.roi_heads.detections_per_img = 750
+
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes=2)
  
@@ -63,22 +70,36 @@ def predict(model: torch.nn.Module,
     Returns list of [x1, y1, x2, y2] bboxes above score_thresh,
     sorted top-left to bottom-right (row-major order).
     """
-    with torch.no_grad():
-        output = model([img_tensor.to(device)])[0]
- 
-    boxes = output["boxes"].cpu().numpy()
-    scores = output["scores"].cpu().numpy()
- 
-    keep = scores >= score_thresh
-    boxes = boxes[keep].astype(int).tolist()
- 
-    # Sort: primarily by y1 (row), secondarily by x1 (col)
-    boxes.sort(key=lambda b: (b[1], b[0]))
-    return boxes
+    all_boxes, all_scores = [], []
+    
+    for scale in [1.0, 1.5]:
+        if scale != 1.0:
+            h, w = img_tensor.shape[1:]
+            scaled = TF.resize(img_tensor, [int(h*scale), int(w*scale)])
+        else:
+            scaled = img_tensor
+        
+        with torch.no_grad():
+            out = model([scaled.to(device)])[0]
+        
+        boxes = out["boxes"].cpu().numpy() / scale
+        scores = out["scores"].cpu().numpy()
+        keep = scores >= score_thresh
+        all_boxes.extend(boxes[keep].tolist())
+        all_scores.extend(scores[keep].tolist())
+    
+    if not all_boxes:
+        return []
+    
+    boxes_t = torch.tensor(all_boxes, dtype=torch.float32)
+    scores_t = torch.tensor(all_scores, dtype=torch.float32)
+    keep = torchvision.ops.nms(boxes_t, scores_t, iou_threshold=0.4)
+    result = boxes_t[keep].int().tolist()
+    result.sort(key=lambda b: (b[1], b[0]))
+    return result
  
  
 def crop_box(img_np: np.ndarray, box: list[int], padding: int = 0) -> np.ndarray:
-    """Crop [x1,y1,x2,y2] from a BGR numpy image."""
     h, w = img_np.shape[:2]
     x1 = max(0, box[0] - padding)
     y1 = max(0, box[1] - padding)
@@ -115,7 +136,6 @@ def process_image(img_path: Path,
         print(f"  [WARN] No cells detected in {img_path.name}")
         return 0
  
-    # Save individual cell crops
     cell_dir = out_dir / img_path.stem
     cell_dir.mkdir(parents=True, exist_ok=True)
  
@@ -126,7 +146,6 @@ def process_image(img_path: Path,
         cell_path = cell_dir / f"cell_{i+1:04d}.png"
         cv2.imwrite(str(cell_path), crop)
  
-    # Optional debug image
     if debug:
         debug_img = draw_boxes(img_bgr, boxes)
         cv2.imwrite(str(out_dir / f"{img_path.stem}_debug.png"), debug_img)
@@ -181,7 +200,7 @@ def main() -> None:
                         help="Directory of new scorecard images")
     parser.add_argument("--output", default="output_cells/",
                         help="Directory to save cropped cell PNGs")
-    parser.add_argument("--score", type=float, default=0.5,
+    parser.add_argument("--score", type=float, default=0.3,
                         help="Confidence threshold (default 0.5)")
     parser.add_argument("--debug", action="store_true",
                         help="Save full images with detected boxes drawn")

@@ -35,6 +35,7 @@ from scorecard_segmentation_extraction import (
     _collect_label_jsons,
     _load_label_sample,
     _resize_with_pad,
+    _build_intersection_grid,
     GridDecoder,
     InferConfig,
     DecodedGrid,
@@ -426,6 +427,21 @@ class TrainConfig:
     seed: int = 7
     junction_dilate_px: int = 4
     num_workers: int = 0
+    no_augment: bool = False
+
+    # Per-channel loss weights [table, v, h, junction].
+    ch_w_table: float = 1.0
+    ch_w_v: float = 2.0
+    ch_w_h: float = 2.0
+    ch_w_j: float = 3.0
+    pos_w_table: float = 1.0
+    pos_w_v: float = 7.0
+    pos_w_h: float = 7.0
+    pos_w_j: float = 10.0
+    neg_w_table: float = 1.0
+    neg_w_v: float = 1.4
+    neg_w_h: float = 1.4
+    neg_w_j: float = 1.6
 
     pretrain_images_dir: Optional[Path] = None
     pretrain_epochs: int = 0
@@ -455,7 +471,7 @@ def train_model(cfg: TrainConfig) -> None:
             return len(self.files)
 
         def _augment(self, image: np.ndarray, masks: list[np.ndarray]) -> tuple[np.ndarray, list[np.ndarray]]:
-            if not self.is_train:
+            if not self.is_train or bool(cfg.no_augment):
                 return image, masks
 
             if random.random() < 0.62:
@@ -772,9 +788,21 @@ def train_model(cfg: TrainConfig) -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(4, int(cfg.epochs)))
 
-    ch_weights = torch.tensor([1.0, 2.0, 2.0, 3.0], dtype=torch.float32, device=device).view(1, 4, 1, 1)
-    pos_w = torch.tensor([1.0, 7.0, 7.0, 10.0], dtype=torch.float32, device=device).view(1, 4, 1, 1)
-    neg_w = torch.tensor([1.0, 1.4, 1.4, 1.6], dtype=torch.float32, device=device).view(1, 4, 1, 1)
+    ch_weights = torch.tensor(
+        [float(cfg.ch_w_table), float(cfg.ch_w_v), float(cfg.ch_w_h), float(cfg.ch_w_j)],
+        dtype=torch.float32,
+        device=device,
+    ).view(1, 4, 1, 1)
+    pos_w = torch.tensor(
+        [float(cfg.pos_w_table), float(cfg.pos_w_v), float(cfg.pos_w_h), float(cfg.pos_w_j)],
+        dtype=torch.float32,
+        device=device,
+    ).view(1, 4, 1, 1)
+    neg_w = torch.tensor(
+        [float(cfg.neg_w_table), float(cfg.neg_w_v), float(cfg.neg_w_h), float(cfg.neg_w_j)],
+        dtype=torch.float32,
+        device=device,
+    ).view(1, 4, 1, 1)
 
     def loss_fn(logits: Any, target: Any) -> Any:
         bce_raw = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
@@ -873,9 +901,36 @@ def _load_model(weights: Path, device: str) -> tuple[Any, Any, Any, dict]:
     return model, torch, F, payload
 
 
-def _predict_maps(model: Any, torch: Any, F: Any, image_bgr: np.ndarray, device: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _predict_maps(
+    model: Any,
+    torch: Any,
+    F: Any,
+    image_bgr: np.ndarray,
+    device: str,
+    model_input_size: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     device_name = _select_device(torch, requested=device)
-    img = image_bgr.astype(np.float32) / 255.0
+    h0, w0 = image_bgr.shape[:2]
+    use_resize = int(model_input_size) > 32
+    if use_resize:
+        size = int(model_input_size)
+        scale = float(size) / float(max(1, max(h0, w0)))
+        nh = max(1, int(round(h0 * scale)))
+        nw = max(1, int(round(w0 * scale)))
+        img_r = cv2.resize(image_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        top = (size - nh) // 2
+        left = (size - nw) // 2
+        canvas = np.zeros((size, size, 3), dtype=np.uint8)
+        canvas[top : top + nh, left : left + nw] = img_r
+        model_img = canvas
+    else:
+        top = 0
+        left = 0
+        nh = h0
+        nw = w0
+        model_img = image_bgr
+
+    img = model_img.astype(np.float32) / 255.0
     x = torch.from_numpy(np.transpose(img, (2, 0, 1))).float().unsqueeze(0).to(torch.device(device_name))
 
     _, _, h, w = x.shape
@@ -889,6 +944,12 @@ def _predict_maps(model: Any, torch: Any, F: Any, image_bgr: np.ndarray, device:
         probs = torch.sigmoid(logits)
 
     probs = probs[:, :, :h, :w][0].cpu().numpy().astype(np.float32)
+    if use_resize:
+        probs = probs[:, top : top + nh, left : left + nw]
+        up = np.zeros((probs.shape[0], h0, w0), dtype=np.float32)
+        for c in range(probs.shape[0]):
+            up[c] = cv2.resize(probs[c], (w0, h0), interpolation=cv2.INTER_LINEAR)
+        probs = up
     return probs[0], probs[1], probs[2], probs[3]
 
 
@@ -902,16 +963,25 @@ def _run_one_with_model(
     device: str,
     pre_cfg: Optional[PreprocessConfig] = None,
     force_output_rotate_180: bool = False,
+    skip_preprocess: bool = False,
+    model_input_size: int = 0,
 ) -> dict:
     _ensure_dir(output_dir)
     raw = cv2.imread(str(input_image), cv2.IMREAD_COLOR)
     if raw is None:
         raise FileNotFoundError(f"Failed to load image: {input_image}")
 
-    pre_cfg_eff = pre_cfg or PreprocessConfig(ensure_upright=False)
-    prep = preprocess_scorecard(raw, pre_cfg_eff)
-    image0 = prep.image_bgr
-    allow_upright = bool(pre_cfg_eff.ensure_upright)
+    if bool(skip_preprocess):
+        pre_cfg_eff = PreprocessConfig(ensure_upright=False)
+        image0 = raw.copy()
+        allow_upright = False
+        base_upright_rot = 0
+    else:
+        pre_cfg_eff = pre_cfg or PreprocessConfig(ensure_upright=False)
+        prep = preprocess_scorecard(raw, pre_cfg_eff)
+        image0 = prep.image_bgr
+        allow_upright = bool(pre_cfg_eff.ensure_upright)
+        base_upright_rot = int(prep.upright_rotation_degrees)
 
     decoder = GridDecoder(infer_cfg)
 
@@ -933,6 +1003,24 @@ def _run_one_with_model(
                 v_pres = v_pres[::-1, ::-1].copy()
             if h_pres.ndim == 2:
                 h_pres = h_pres[::-1, ::-1].copy()
+            v_polys = None
+            if dec.v_polylines is not None:
+                vp = []
+                for poly in dec.v_polylines:
+                    rp = [[int((w - 1) - int(pt[0])), int((h - 1) - int(pt[1]))] for pt in poly]
+                    mx = float(np.mean([p[0] for p in rp])) if rp else 0.0
+                    vp.append((mx, rp))
+                vp.sort(key=lambda t: t[0])
+                v_polys = [p for _, p in vp]
+            h_polys = None
+            if dec.h_polylines is not None:
+                hp = []
+                for poly in dec.h_polylines:
+                    rp = [[int((w - 1) - int(pt[0])), int((h - 1) - int(pt[1]))] for pt in poly]
+                    my = float(np.mean([p[1] for p in rp])) if rp else 0.0
+                    hp.append((my, rp))
+                hp.sort(key=lambda t: t[0])
+                h_polys = [p for _, p in hp]
             out.append(
                 DecodedGrid(
                     table_id=int(dec.table_id),
@@ -941,6 +1029,8 @@ def _run_one_with_model(
                     y_lines=[int(v) for v in y_lines],
                     v_presence=v_pres,
                     h_presence=h_pres,
+                    v_polylines=v_polys,
+                    h_polylines=h_polys,
                 )
             )
         return out
@@ -983,7 +1073,14 @@ def _run_one_with_model(
         cand_imgs = [(0, image0), (180, cv2.rotate(image0, cv2.ROTATE_180))]
     cand_out: list[tuple[float, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[Any]]] = []
     for add_rot, cand_img in cand_imgs:
-        tp, vp, hp, jp = _predict_maps(model, torch, F, cand_img, device=device)
+        tp, vp, hp, jp = _predict_maps(
+            model,
+            torch,
+            F,
+            cand_img,
+            device=device,
+            model_input_size=int(model_input_size),
+        )
         dec = decoder.decode_all(tp, vp, hp, jp, image_bgr=cand_img)
         sc = _cand_score(cand_img, tp, vp, hp, jp, dec)
         cand_out.append((sc, add_rot, cand_img, tp, vp, hp, jp, dec))
@@ -1000,7 +1097,7 @@ def _run_one_with_model(
             if s180 <= s0 + 0.45:
                 cand_out[0] = by_rot[0]
     _, add_rot, image, table_prob, v_prob, h_prob, j_prob, decoded = cand_out[0]
-    upright_rot = int((int(prep.upright_rotation_degrees) + int(add_rot)) % 360)
+    upright_rot = int((int(base_upright_rot) + int(add_rot)) % 360)
 
     if allow_upright:
         # Final orientation correction for output artifacts:
@@ -1053,29 +1150,52 @@ def _run_one_with_model(
         x0, y0, x1, y1 = dec.bbox
         cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 220, 0), 2)
         # Draw segments according to presence maps so merged cells are visualized
-        # correctly; full-height/width lines are misleading.
+        # correctly; prefer warped polyline intersections when available.
         rows = max(0, len(dec.y_lines) - 1)
         cols = max(0, len(dec.x_lines) - 1)
+        gpts = _build_intersection_grid(dec.x_lines, dec.y_lines, dec.v_polylines, dec.h_polylines)
         for i, x in enumerate(dec.x_lines):
             for r in range(rows):
                 if dec.v_presence.shape == (rows, len(dec.x_lines)):
                     if i < dec.v_presence.shape[1] and r < dec.v_presence.shape[0] and int(dec.v_presence[r, i]) == 0:
                         continue
-                ya = int(dec.y_lines[r])
-                yb = int(dec.y_lines[r + 1])
-                if yb <= ya:
-                    continue
-                cv2.line(overlay, (int(x), ya), (int(x), yb), (255, 80, 80), 1)
+                if gpts is not None:
+                    p0 = gpts[r][i]
+                    p1 = gpts[r + 1][i]
+                    cv2.line(
+                        overlay,
+                        (int(round(p0[0])), int(round(p0[1]))),
+                        (int(round(p1[0])), int(round(p1[1]))),
+                        (255, 80, 80),
+                        1,
+                    )
+                else:
+                    ya = int(dec.y_lines[r])
+                    yb = int(dec.y_lines[r + 1])
+                    if yb <= ya:
+                        continue
+                    cv2.line(overlay, (int(x), ya), (int(x), yb), (255, 80, 80), 1)
         for j, y in enumerate(dec.y_lines):
             for c in range(cols):
                 if dec.h_presence.shape == (len(dec.y_lines), cols):
                     if j < dec.h_presence.shape[0] and c < dec.h_presence.shape[1] and int(dec.h_presence[j, c]) == 0:
                         continue
-                xa = int(dec.x_lines[c])
-                xb = int(dec.x_lines[c + 1])
-                if xb <= xa:
-                    continue
-                cv2.line(overlay, (xa, int(y)), (xb, int(y)), (80, 80, 255), 1)
+                if gpts is not None:
+                    p0 = gpts[j][c]
+                    p1 = gpts[j][c + 1]
+                    cv2.line(
+                        overlay,
+                        (int(round(p0[0])), int(round(p0[1]))),
+                        (int(round(p1[0])), int(round(p1[1]))),
+                        (80, 80, 255),
+                        1,
+                    )
+                else:
+                    xa = int(dec.x_lines[c])
+                    xb = int(dec.x_lines[c + 1])
+                    if xb <= xa:
+                        continue
+                    cv2.line(overlay, (xa, int(y)), (xb, int(y)), (80, 80, 255), 1)
         cv2.putText(
             overlay,
             f"table_{dec.table_id:02d}",
@@ -1112,8 +1232,13 @@ def _run_one(
     device: str,
     pre_cfg: Optional[PreprocessConfig] = None,
     force_output_rotate_180: bool = False,
+    skip_preprocess: bool = False,
+    model_input_size_override: int = -1,
 ) -> dict:
-    model, torch, F, _ = _load_model(weights=weights, device=device)
+    model, torch, F, payload = _load_model(weights=weights, device=device)
+    model_input_size = int(payload.get("train_size", 0)) if isinstance(payload, dict) else 0
+    if int(model_input_size_override) >= 0:
+        model_input_size = int(model_input_size_override)
     return _run_one_with_model(
         model=model,
         torch=torch,
@@ -1124,6 +1249,8 @@ def _run_one(
         device=device,
         pre_cfg=pre_cfg or PreprocessConfig(),
         force_output_rotate_180=bool(force_output_rotate_180),
+        skip_preprocess=bool(skip_preprocess),
+        model_input_size=int(model_input_size),
     )
 
 
@@ -1146,6 +1273,19 @@ def _train_cli(args: argparse.Namespace) -> None:
         seed=int(args.seed),
         junction_dilate_px=int(args.junction_dilate_px),
         num_workers=int(args.num_workers),
+        no_augment=bool(args.no_augment),
+        ch_w_table=float(args.ch_w_table),
+        ch_w_v=float(args.ch_w_v),
+        ch_w_h=float(args.ch_w_h),
+        ch_w_j=float(args.ch_w_j),
+        pos_w_table=float(args.pos_w_table),
+        pos_w_v=float(args.pos_w_v),
+        pos_w_h=float(args.pos_w_h),
+        pos_w_j=float(args.pos_w_j),
+        neg_w_table=float(args.neg_w_table),
+        neg_w_v=float(args.neg_w_v),
+        neg_w_h=float(args.neg_w_h),
+        neg_w_j=float(args.neg_w_j),
         pretrain_images_dir=pre_dir,
         pretrain_epochs=int(args.pretrain_epochs),
         pretrain_batch_size=int(args.pretrain_batch_size),
@@ -1180,6 +1320,11 @@ def _infer_cfg_from_args(args: argparse.Namespace) -> InferConfig:
         min_line_cov=float(args.min_line_cov),
         line_band_px=int(args.line_band_px),
         flexible_band_px=int(args.flexible_band_px),
+        conservative_table_bbox=bool(getattr(args, "conservative_table_bbox", False)),
+        conservative_max_width_ratio=float(getattr(args, "conservative_max_width_ratio", 0.88)),
+        conservative_max_height_ratio=float(getattr(args, "conservative_max_height_ratio", 0.96)),
+        conservative_prefer_compact_bonus=float(getattr(args, "conservative_prefer_compact_bonus", 0.22)),
+        legacy_decode=bool(getattr(args, "legacy_decode", False)),
         auto_tune_decode=not bool(args.no_auto_tune),
         cell_inset_px=int(args.cell_inset),
         min_cell_w=int(args.min_cell_w),
@@ -1203,6 +1348,10 @@ def _infer_cli(args: argparse.Namespace) -> None:
         device=str(args.device),
         pre_cfg=pre_cfg,
         force_output_rotate_180=bool(args.force_output_rotate_180),
+        skip_preprocess=bool(args.skip_preprocess),
+        model_input_size_override=(
+            0 if bool(args.ignore_checkpoint_train_size) else int(args.model_input_size_override)
+        ),
     )
     print(f"Image: {args.input}")
     print(f"Output: {args.output_dir}")
@@ -1231,7 +1380,12 @@ def _batch_cli(args: argparse.Namespace) -> None:
         print(f"No PNG images found in {inp_dir}")
         return
 
-    model, torch, F, _ = _load_model(weights=Path(args.weights), device=str(args.device))
+    model, torch, F, payload = _load_model(weights=Path(args.weights), device=str(args.device))
+    model_input_size = int(payload.get("train_size", 0)) if isinstance(payload, dict) else 0
+    if bool(args.ignore_checkpoint_train_size):
+        model_input_size = 0
+    if int(args.model_input_size_override) > 0:
+        model_input_size = int(args.model_input_size_override)
     for p in imgs:
         out = out_root / p.stem
         result = _run_one_with_model(
@@ -1244,6 +1398,8 @@ def _batch_cli(args: argparse.Namespace) -> None:
             device=str(args.device),
             pre_cfg=pre_cfg,
             force_output_rotate_180=bool(args.force_output_rotate_180),
+            skip_preprocess=bool(args.skip_preprocess),
+            model_input_size=int(model_input_size),
         )
         table_str = ", ".join([f"t{int(t['table_id'])}:r{int(t['rows_base'])}c{int(t['cols_base'])}" for t in result["tables"]])
         print(f"{p.name}: tables={result['table_count']} [{table_str}] rot={result['upright_rotation_degrees']}")
@@ -1265,6 +1421,19 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--seed", type=int, default=7)
     tr.add_argument("--junction_dilate_px", type=int, default=4)
     tr.add_argument("--num_workers", type=int, default=0)
+    tr.add_argument("--no_augment", action="store_true")
+    tr.add_argument("--ch_w_table", type=float, default=1.0)
+    tr.add_argument("--ch_w_v", type=float, default=2.0)
+    tr.add_argument("--ch_w_h", type=float, default=2.0)
+    tr.add_argument("--ch_w_j", type=float, default=3.0)
+    tr.add_argument("--pos_w_table", type=float, default=1.0)
+    tr.add_argument("--pos_w_v", type=float, default=7.0)
+    tr.add_argument("--pos_w_h", type=float, default=7.0)
+    tr.add_argument("--pos_w_j", type=float, default=10.0)
+    tr.add_argument("--neg_w_table", type=float, default=1.0)
+    tr.add_argument("--neg_w_v", type=float, default=1.4)
+    tr.add_argument("--neg_w_h", type=float, default=1.4)
+    tr.add_argument("--neg_w_j", type=float, default=1.6)
     tr.add_argument("--pretrain_images_dir", default="")
     tr.add_argument("--pretrain_epochs", type=int, default=0)
     tr.add_argument("--pretrain_batch_size", type=int, default=4)
@@ -1300,6 +1469,11 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument("--min_line_cov", type=float, default=0.24)
     inf.add_argument("--line_band_px", type=int, default=4)
     inf.add_argument("--flexible_band_px", type=int, default=10)
+    inf.add_argument("--conservative_table_bbox", action="store_true", help="Prefer compact table boxes and avoid full-page expansion.")
+    inf.add_argument("--conservative_max_width_ratio", type=float, default=0.88)
+    inf.add_argument("--conservative_max_height_ratio", type=float, default=0.96)
+    inf.add_argument("--conservative_prefer_compact_bonus", type=float, default=0.22)
+    inf.add_argument("--legacy_decode", action="store_true", help="Use legacy decode path (raw model maps, no fused evidence).")
     inf.add_argument("--cell_inset", type=int, default=2)
     inf.add_argument("--min_cell_w", type=int, default=10)
     inf.add_argument("--min_cell_h", type=int, default=10)
@@ -1307,6 +1481,18 @@ def build_parser() -> argparse.ArgumentParser:
     inf.add_argument("--upright", action="store_true", help="Enable 90/180 upright normalization (disabled by default).")
     inf.add_argument("--no_upright", action="store_true", help=argparse.SUPPRESS)
     inf.add_argument("--force_output_rotate_180", action="store_true")
+    inf.add_argument("--skip_preprocess", action="store_true", help="Skip preprocessing and run model on raw input pixels.")
+    inf.add_argument(
+        "--ignore_checkpoint_train_size",
+        action="store_true",
+        help="Do not resize/pad input to checkpoint train_size; run model on full-resolution image.",
+    )
+    inf.add_argument(
+        "--model_input_size_override",
+        type=int,
+        default=-1,
+        help="Explicit model input size; >0 forces resize/pad, 0 disables resize, -1 keeps checkpoint default.",
+    )
     inf.set_defaults(func=_infer_cli)
 
     bt = sub.add_parser("batch", help="Infer all PNG images in a folder")
@@ -1334,6 +1520,11 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--min_line_cov", type=float, default=0.24)
     bt.add_argument("--line_band_px", type=int, default=4)
     bt.add_argument("--flexible_band_px", type=int, default=10)
+    bt.add_argument("--conservative_table_bbox", action="store_true", help="Prefer compact table boxes and avoid full-page expansion.")
+    bt.add_argument("--conservative_max_width_ratio", type=float, default=0.88)
+    bt.add_argument("--conservative_max_height_ratio", type=float, default=0.96)
+    bt.add_argument("--conservative_prefer_compact_bonus", type=float, default=0.22)
+    bt.add_argument("--legacy_decode", action="store_true", help="Use legacy decode path (raw model maps, no fused evidence).")
     bt.add_argument("--cell_inset", type=int, default=2)
     bt.add_argument("--min_cell_w", type=int, default=10)
     bt.add_argument("--min_cell_h", type=int, default=10)
@@ -1341,6 +1532,18 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--upright", action="store_true", help="Enable 90/180 upright normalization (disabled by default).")
     bt.add_argument("--no_upright", action="store_true", help=argparse.SUPPRESS)
     bt.add_argument("--force_output_rotate_180", action="store_true")
+    bt.add_argument("--skip_preprocess", action="store_true", help="Skip preprocessing and run model on raw input pixels.")
+    bt.add_argument(
+        "--ignore_checkpoint_train_size",
+        action="store_true",
+        help="Do not resize/pad input to checkpoint train_size; run model on full-resolution image.",
+    )
+    bt.add_argument(
+        "--model_input_size_override",
+        type=int,
+        default=-1,
+        help="Explicit model input size; >0 forces resize/pad, 0 disables resize, -1 keeps checkpoint default.",
+    )
     bt.set_defaults(func=_batch_cli)
     return p
 
